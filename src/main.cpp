@@ -59,6 +59,9 @@ String topic_setpoint;
 #define ADDR_HORA_LIGA    2   // hora de ligar (0–23)
 #define ADDR_HORA_DESLIGA 3   // hora de desligar (0–23)
 
+// ─── Versão do firmware ───────────────────────────────────────────────────────
+#define FIRMWARE_VERSION "1.0.0"
+
 // ─── OTA ──────────────────────────────────────────────────────────────────────
 WebServer otaServer(80);
 // OTA_AP_SENHA removida — AP aberto (sem senha)
@@ -170,7 +173,7 @@ void entrarModoOTA() {
       "border-radius:6px;font-size:16px}"
       ".btn2{background:#28a745}.btn3{background:#dc3545}</style></head><body>"
       "<h2>🔧 HVAC Controladora</h2>"
-      "<p><b>ID:</b> " + mqtt_id + "</p>"
+      "<p><b>ID:</b> " + mqtt_id + " &nbsp;|&nbsp; <b>v" FIRMWARE_VERSION "</b></p>"
       "<p><b>IP:</b> " + WiFi.softAPIP().toString() + "</p>"
       "<br>"
       "<a class='btn' href='/update'>📦 Atualizar Firmware</a><br>"
@@ -589,7 +592,7 @@ void setup() {
   topic_setpoint    = prefix + "/SETPOINT/SET";
 
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  Serial.println("🔧 CONTROLADORA HVAC | ID: " + mqtt_id);
+  Serial.println("🔧 CONTROLADORA HVAC | ID: " + mqtt_id + " | v" FIRMWARE_VERSION);
   Serial.printf( "   RELE1   GPIO%-2d  NIVEL=%s\n", RELE1_PIN, RELE_LIGADO == HIGH ? "HIGH" : "LOW");
   Serial.printf( "   DS18B20 GPIO%-2d\n", ONE_WIRE_BUS);
   Serial.printf( "   PWM     GPIO%-2d\n", PWM_PIN1);
