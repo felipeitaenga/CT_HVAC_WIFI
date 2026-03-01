@@ -147,8 +147,8 @@ void entrarModoOTA() {
   Serial.println("🔄 ENTRANDO EM MODO OTA");
   digitalWrite(RELE1_PIN, RELE_DESLIGADO);
   client.disconnect();
-  WiFi.disconnect();
-  delay(500);
+  WiFi.mode(WIFI_AP_STA);  // mantém STA conectado + sobe AP
+  delay(300);
 
   String apNome = "HVAC-" + mqtt_id + "-OTA";
   WiFi.softAP(apNome.c_str());  // sem senha
@@ -171,13 +171,14 @@ void entrarModoOTA() {
       "h2{color:#333}.btn{display:inline-block;padding:12px 24px;margin:8px;"
       "background:#0078d4;color:white;text-decoration:none;"
       "border-radius:6px;font-size:16px}"
-      ".btn2{background:#28a745}.btn3{background:#dc3545}</style></head><body>"
+      ".btn2{background:#28a745}.btn3{background:#dc3545}.btn4{background:#6f42c1}</style></head><body>"
       "<h2>🔧 HVAC Controladora</h2>"
       "<p><b>ID:</b> " + mqtt_id + " &nbsp;|&nbsp; <b>v" FIRMWARE_VERSION "</b></p>"
-      "<p><b>IP:</b> " + WiFi.softAPIP().toString() + "</p>"
+      "<p><b>IP AP:</b> " + WiFi.softAPIP().toString() + "</p>"
       "<br>"
       "<a class='btn' href='/update'>📦 Atualizar Firmware</a><br>"
       "<a class='btn btn2' href='/config'>⏱️ Configurar Agenda</a><br>"
+      "<a class='btn btn4' href='/mqtt-test'>🔌 Testar Conexão MQTT</a><br>"
       "<a class='btn btn3' href='/restart' onclick=\"return confirm('Reiniciar a controladora?')\">🔄 Reiniciar Controladora</a>"
       "</body></html>";
     otaServer.send(200, "text/html", html);
@@ -278,6 +279,56 @@ void entrarModoOTA() {
     otaServer.send(200, "text/html", html);
     delay(500);
     ESP.restart();
+  });
+
+  // ── Teste de conexão MQTT ────────────────────────────────────────────────────
+  otaServer.on("/mqtt-test", HTTP_GET, []() {
+    bool wifiOK = (WiFi.status() == WL_CONNECTED);
+    bool mqttOK = false;
+    unsigned long t0 = millis();
+
+    if (wifiOK) {
+      WiFiClient testNet;
+      testNet.setTimeout(3000);
+      MQTTClient testClient(256);
+      testClient.begin(mqtt_server, testNet);
+      String testId = mqtt_id + "_test";
+      mqttOK = testClient.connect(testId.c_str(), mqtt_username, mqtt_password);
+      if (mqttOK) testClient.disconnect();
+      testNet.stop();
+    }
+
+    unsigned long elapsed = millis() - t0;
+    String cor  = mqttOK ? "#d4edda" : "#f8d7da";
+    String icon = mqttOK ? "✅" : "❌";
+    String msg  = mqttOK ? "Conectado com sucesso!" : "Falha na conexao";
+
+    String html =
+      "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<style>body{font-family:sans-serif;text-align:center;padding:20px}"
+      "h2{color:#333}.card{background:" + cor + ";border-radius:8px;"
+      "padding:20px;margin:12px auto;max-width:400px}"
+      ".lbl{color:#555;font-size:13px}.val{font-size:18px;font-weight:bold}"
+      ".btn{display:inline-block;padding:10px 24px;margin:6px;"
+      "color:white;text-decoration:none;border-radius:6px}"
+      ".b1{background:#0078d4}.b2{background:#6f42c1}"
+      "</style></head><body>"
+      "<h2>🔌 Teste MQTT</h2>"
+      "<div class='card'>"
+      "<p style='font-size:48px;margin:0'>" + icon + "</p>"
+      "<p class='val'>" + msg + "</p><hr>"
+      "<p><span class='lbl'>Wi-Fi: </span>"
+        + (wifiOK ? "✅ " + WiFi.localIP().toString() : "❌ Desconectado") + "</p>"
+      "<p><span class='lbl'>Servidor: </span>" + String(mqtt_server) + ":1883</p>"
+      "<p><span class='lbl'>ID testado: </span>" + mqtt_id + "_test</p>"
+      "<p><span class='lbl'>Tempo resposta: </span>" + String(elapsed) + " ms</p>"
+      "</div>"
+      "<a class='btn b1' href='/'>&#8592; Voltar</a>"
+      "<a class='btn b2' href='/mqtt-test'>&#x1F504; Testar de novo</a>"
+      "</body></html>";
+
+    otaServer.send(200, "text/html", html);
   });
 
   ElegantOTA.begin(&otaServer);

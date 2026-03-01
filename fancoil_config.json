@@ -1,0 +1,48 @@
+{
+  "mqtt": {
+    "broker": "156.67.82.199",
+    "port": "1883",
+    "username": "",
+    "password": "",
+    "payload_on": "1",
+    "payload_off": "0"
+  },
+  "general_schedule": {
+    "monday": {
+      "on": "07:00",
+      "off": "18:00",
+      "enabled": true
+    },
+    "tuesday": {
+      "on": "07:00",
+      "off": "18:00",
+      "enabled": true
+    },
+    "wednesday": {
+      "on": "07:00",
+      "off": "18:00",
+      "enabled": true
+    },
+    "thursday": {
+      "on": "07:00",
+      "off": "18:00",
+      "enabled": true
+    },
+    "friday": {
+      "on": "07:00",
+      "off": "18:00",
+      "enabled": true
+    },
+    "saturday": {
+      "on": "",
+      "off": "",
+      "enabled": false
+    },
+    "sunday": {
+      "on": "",
+      "off": "",
+      "enabled": false
+    }
+  },
+  "cmds": []
+}
