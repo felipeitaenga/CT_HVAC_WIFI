@@ -60,7 +60,7 @@ String topic_setpoint;
 #define ADDR_HORA_DESLIGA 3   // hora de desligar (0–23)
 
 // ─── Versão do firmware ───────────────────────────────────────────────────────
-#define FIRMWARE_VERSION "1.1.0"
+#define FIRMWARE_VERSION "1.0.1"
 
 // ─── OTA ──────────────────────────────────────────────────────────────────────
 WebServer otaServer(80);
