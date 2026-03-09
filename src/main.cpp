@@ -1,4 +1,4 @@
-#include <WiFi.h>
+﻿#include <WiFi.h>
 #include <MQTT.h>
 #include <OneWire.h>
 #include <PID_v1.h>
@@ -60,7 +60,7 @@ String topic_setpoint;
 #define ADDR_HORA_DESLIGA 3   // hora de desligar (0–23)
 
 // ─── Versão do firmware ───────────────────────────────────────────────────────
-#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_VERSION "1.1.0"
 
 // ─── OTA ──────────────────────────────────────────────────────────────────────
 WebServer otaServer(80);
@@ -134,10 +134,13 @@ void carregarAgenda() {
 }
 
 // ─── MQTT publish com log ─────────────────────────────────────────────────────
-void mqttPublish(const String& topic, const String& payload) {
-  bool ok = client.publish(topic, payload);
-  Serial.printf("📤 ENVIADO   [%s] → \"%s\" %s\n",
-                topic.c_str(), payload.c_str(), ok ? "✅" : "❌ FALHOU");
+// retained=true -> broker guarda ultima mensagem e entrega imediatamente a novos subscribers
+void mqttPublish(const String& topic, const String& payload, bool retained = false) {
+  bool ok = client.publish(topic, payload, retained, 0);
+  Serial.printf("­ƒôñ ENVIADO   [%s] ÔåÆ \"%s\" %s%s\n",
+                topic.c_str(), payload.c_str(),
+                ok ? "Ô£à" : "ÔØî FALHOU",
+                retained ? " ­ƒôî" : "");
 }
 
 
@@ -392,7 +395,7 @@ void ligarRele(const char* motivo) {
   releAtivado = true;
   pid1.SetMode(AUTOMATIC);
   Serial.println("✅ RELÉ LIGADO");
-  mqttPublish(topic_cmd, "true");
+  mqttPublish(topic_cmd, "true", true);
 }
 
 // ─── Desliga relé ─────────────────────────────────────────────────────────────
@@ -407,8 +410,8 @@ void desligarRele(const char* motivo) {
   salvarRele(RELE_DESLIGADO);
   releAtivado = false;
   Serial.println("⛔ RELÉ DESLIGADO");
-  mqttPublish(topic_vag, "0");
-  mqttPublish(topic_cmd, "false");
+  mqttPublish(topic_vag, "0", true);
+  mqttPublish(topic_cmd, "false", true);
 }
 
 // ─── Aplica horário ───────────────────────────────────────────────────────────
@@ -532,8 +535,8 @@ void reconnectMQTT() {
     modoAnterior   = -1;
     statusAnterior = -1;
     lerEPublicarEntradas();
-    mqttPublish(topic_cmd,    releAtivado ? "true" : "false");
-    mqttPublish(topic_estado, estadoControladora == 1 ? "true" : "false");
+    mqttPublish(topic_cmd,    releAtivado ? "true" : "false", true);
+    mqttPublish(topic_estado, estadoControladora == 1 ? "true" : "false", true);
   } else {
     Serial.printf("⚠️ MQTT falhou | erro: %d\n", client.lastError());
   }
@@ -571,7 +574,7 @@ void messageReceived(String &topic, String &payload) {
       String estadoReal = releAtivado ? "true" : "false";
       if (payload != estadoReal) {
         Serial.printf("   🔄 Corrigindo ScadaBR: CMD real = \"%s\"\n", estadoReal.c_str());
-        mqttPublish(topic_cmd, estadoReal);
+        mqttPublish(topic_cmd, estadoReal, true);
       } else {
         Serial.println("   ℹ️ CMD ignorado → ScadaBR já sincronizado");
       }
@@ -594,13 +597,13 @@ void vagPID() {
     analogWrite(PWM_PIN1, pwm);
     Serial.printf("   🌡️  Temp: %.1f°C | Setpoint: %.1f°C | PWM: %d (%.1f%%)\n",
                   temperatura, setpoint, pwm, pct);
-    mqttPublish(topic_temperatura, String(temperatura, 1));
-    mqttPublish(topic_vag,         String(pct, 1));
+    mqttPublish(topic_temperatura, String(temperatura, 1), true);
+    mqttPublish(topic_vag,         String(pct, 1), true);
   } else {
     analogWrite(PWM_PIN1, 0);
     Serial.printf("   🌡️  Temp: %.1f°C | Relé desligado\n", temperatura);
-    mqttPublish(topic_temperatura, String(temperatura, 1));
-    mqttPublish(topic_vag,         "0");
+    mqttPublish(topic_temperatura, String(temperatura, 1), true);
+    mqttPublish(topic_vag,         "0", true);
   }
 }
 
