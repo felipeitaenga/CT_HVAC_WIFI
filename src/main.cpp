@@ -6,6 +6,7 @@
 #include <EEPROM.h>
 #include <WiFiManager.h>
 #include <time.h>
+#include <math.h>
 #include <WebServer.h>
 #include <ElegantOTA.h>
 
@@ -33,6 +34,7 @@ String topic_status;
 String topic_cmd;
 String topic_estado;
 String topic_setpoint;
+String topic_online;
 
 // ─── Hardware ─────────────────────────────────────────────────────────────────
 #define ONE_WIRE_BUS    13
@@ -53,11 +55,13 @@ String topic_setpoint;
 #define KI1  5
 #define KD1  2
 
-#define EEPROM_SIZE       7
+#define EEPROM_SIZE       16
 #define ADDR_RELE1        0
 #define ADDR_DIAS         1   // bitmap: bit0=Dom, bit1=Seg ... bit6=Sáb
 #define ADDR_HORA_LIGA    2   // hora de ligar (0–23)
 #define ADDR_HORA_DESLIGA 3   // hora de desligar (0–23)
+#define ADDR_ESTADO_CTRL  4   // estadoControladora (0=CMD, 1=HORÁRIO)
+#define ADDR_SETPOINT     8   // float (4 bytes) — setpoint persistido
 
 // ─── Versão do firmware ───────────────────────────────────────────────────────
 #define FIRMWARE_VERSION "1.0.1"
@@ -72,12 +76,12 @@ unsigned long buttonPressStartTime = 0;
 bool          btnOtaArmed          = false;
 const unsigned long buttonPressThreshold = 5000;
 
-double temperatura, vag, setpoint;
+double temperatura, vag, setpoint = 23.0;   // default seguro (PID REVERSE: 0 → fan 100%)
 PID pid1(&temperatura, &vag, &setpoint, KP1, KI1, KD1, REVERSE);
 
 int  estadoControladora = 1;
 bool releAtivado        = false;
-bool portalAtivo        = false;
+volatile bool portalAtivo = false;   // escrito no loop/callbacks, lido na taskLED
 
 int modoAnterior   = -1;
 int statusAnterior = -1;
@@ -85,7 +89,7 @@ int statusAnterior = -1;
 unsigned long ts1          = 0;
 unsigned long tsPing       = 0;
 unsigned long ultimoPingOK = 0;
-bool pingOK = false;
+volatile bool pingOK = false;   // escrito no loop, lido na taskLED
 
 // ─── Agenda (carregada da EEPROM) ─────────────────────────────────────────────
 uint8_t schedDias        = 0b00111110; // padrão: Seg–Sex (bits 1–5)
@@ -133,14 +137,38 @@ void carregarAgenda() {
                 schedDias, schedHoraLiga, schedHoraDesliga);
 }
 
+// ─── EEPROM: estado da controladora + setpoint ───────────────────────────────
+void salvarEstadoCtrl() {
+  EEPROM.write(ADDR_ESTADO_CTRL, (uint8_t)estadoControladora);
+  EEPROM.commit();
+}
+
+void salvarSetpoint() {
+  float sp = (float)setpoint;
+  EEPROM.put(ADDR_SETPOINT, sp);
+  EEPROM.commit();
+}
+
+void carregarEstadoCtrl() {
+  uint8_t e = EEPROM.read(ADDR_ESTADO_CTRL);
+  estadoControladora = (e == 0xFF) ? 1 : (e ? 1 : 0);   // EEPROM virgem → HORÁRIO
+
+  float sp;
+  EEPROM.get(ADDR_SETPOINT, sp);
+  setpoint = (isnan(sp) || sp < 10.0 || sp > 35.0) ? 23.0 : sp;
+
+  Serial.printf("📂 Estado carregado | modo=%s | setpoint=%.1f°C\n",
+                estadoControladora == 1 ? "HORÁRIO" : "CMD", setpoint);
+}
+
 // ─── MQTT publish com log ─────────────────────────────────────────────────────
 // retained=true -> broker guarda ultima mensagem e entrega imediatamente a novos subscribers
 void mqttPublish(const String& topic, const String& payload, bool retained = false) {
   bool ok = client.publish(topic, payload, retained, 0);
-  Serial.printf("­ƒôñ ENVIADO   [%s] ÔåÆ \"%s\" %s%s\n",
+  Serial.printf("📤 ENVIADO   [%s] → \"%s\" %s%s\n",
                 topic.c_str(), payload.c_str(),
-                ok ? "Ô£à" : "ÔØî FALHOU",
-                retained ? " ­ƒôî" : "");
+                ok ? "✅" : "❌ FALHOU",
+                retained ? " 📌" : "");
 }
 
 
@@ -149,18 +177,21 @@ void entrarModoOTA() {
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   Serial.println("🔄 ENTRANDO EM MODO OTA");
   digitalWrite(RELE1_PIN, RELE_DESLIGADO);
+  digitalWrite(RELE2_PIN, RELE_DESLIGADO);   // exaustor acompanha o fancoil
+  client.publish(topic_online.c_str(), "0", true, 1); // saída deliberada (OTA) também marca offline
   client.disconnect();
   WiFi.mode(WIFI_AP_STA);  // mantém STA conectado + sobe AP
   delay(300);
 
-  String apNome = "HVAC-" + mqtt_id + "-OTA";
-  WiFi.softAP(apNome.c_str());  // sem senha
+  String apNome  = "HVAC-" + mqtt_id + "-OTA";
+  String apSenha = "hvac" + mqtt_id + "ota";   // >= 8 chars — fecha flash anônimo por rádio
+  WiFi.softAP(apNome.c_str(), apSenha.c_str());
   delay(500);
 
   IPAddress ip = WiFi.softAPIP();
   Serial.println("📶 AP OTA ATIVO");
   Serial.println("   SSID  : " + apNome);
-  Serial.println("   Senha : (aberto)");
+  Serial.println("   Senha : " + apSenha);
   Serial.print(  "   Acesse: http://"); Serial.print(ip); Serial.println("/update");
   Serial.println("   Timeout: 5 minutos");
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -182,7 +213,8 @@ void entrarModoOTA() {
       "<a class='btn' href='/update'>📦 Atualizar Firmware</a><br>"
       "<a class='btn btn2' href='/config'>⏱️ Configurar Agenda</a><br>"
       "<a class='btn btn4' href='/mqtt-test'>🔌 Testar Conexão MQTT</a><br>"
-      "<a class='btn btn3' href='/restart' onclick=\"return confirm('Reiniciar a controladora?')\">🔄 Reiniciar Controladora</a>"
+      "<a class='btn btn3' href='/restart' onclick=\"return confirm('Reiniciar a controladora?')\">🔄 Reiniciar Controladora</a><br>"
+      "<a class='btn btn2' href='/exit' onclick=\"return confirm('Sair do modo OTA e voltar à operação normal?')\">✅ Sair do modo OTA</a>"
       "</body></html>";
     otaServer.send(200, "text/html", html);
   });
@@ -334,6 +366,17 @@ void entrarModoOTA() {
     otaServer.send(200, "text/html", html);
   });
 
+  otaServer.on("/exit", HTTP_GET, []() {
+    otaServer.send(200, "text/html",
+      "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+      "<style>body{font-family:sans-serif;text-align:center;padding:40px}</style></head><body>"
+      "<h2>✅ Saindo do modo OTA...</h2><small>A controladora vai reiniciar.</small>"
+      "</body></html>");
+    delay(300);
+    ESP.restart();
+  });
+
+  ElegantOTA.setAuth("admin", apSenha.c_str());
   ElegantOTA.begin(&otaServer);
   otaServer.begin();
 
@@ -365,7 +408,10 @@ bool dentroDoHorario() {
   const char* diasSemana[] = {"Dom","Seg","Ter","Qua","Qui","Sex","Sáb"};
   bool diaAtivo = (schedDias >> t.tm_wday) & 1;
   bool horario;
-  if (schedHoraDesliga == 0) {
+  if (schedHoraLiga == schedHoraDesliga) {
+    // liga == desliga → sem janela válida, desligado o dia todo
+    horario = false;
+  } else if (schedHoraDesliga == 0) {
     // desliga=0 significa meia-noite → liga das X até 23h59
     horario = (t.tm_hour >= schedHoraLiga);
   } else if (schedHoraDesliga > schedHoraLiga) {
@@ -391,10 +437,11 @@ void ligarRele(const char* motivo) {
                 motivo, releAtivado ? "já ligado" : "false");
   if (releAtivado) return;
   digitalWrite(RELE1_PIN, RELE_LIGADO);
+  digitalWrite(RELE2_PIN, RELE_LIGADO);   // exaustor acompanha o fancoil
   salvarRele(RELE_LIGADO);
   releAtivado = true;
   pid1.SetMode(AUTOMATIC);
-  Serial.println("✅ RELÉ LIGADO");
+  Serial.println("✅ RELÉ LIGADO (fancoil + exaustor)");
   mqttPublish(topic_cmd, "true", true);
 }
 
@@ -407,9 +454,10 @@ void desligarRele(const char* motivo) {
   vag = 0;
   analogWrite(PWM_PIN1, 0);
   digitalWrite(RELE1_PIN, RELE_DESLIGADO);
+  digitalWrite(RELE2_PIN, RELE_DESLIGADO);   // exaustor acompanha o fancoil
   salvarRele(RELE_DESLIGADO);
   releAtivado = false;
-  Serial.println("⛔ RELÉ DESLIGADO");
+  Serial.println("⛔ RELÉ DESLIGADO (fancoil + exaustor)");
   mqttPublish(topic_vag, "0", true);
   mqttPublish(topic_cmd, "false", true);
 }
@@ -417,8 +465,8 @@ void desligarRele(const char* motivo) {
 // ─── Aplica horário ───────────────────────────────────────────────────────────
 void aplicarHorario() {
   Serial.println("📅 aplicarHorario()");
-  if (dentroDoHorario()) ligarRele("ESTADO=1 horário 07h-21h");
-  else                   desligarRele("ESTADO=1 fora do horário");
+  if (dentroDoHorario()) ligarRele("ESTADO=1 dentro da janela agendada");
+  else                   desligarRele("ESTADO=1 fora da janela agendada");
 }
 
 // ─── Entradas digitais → publica se mudou ────────────────────────────────────
@@ -516,7 +564,7 @@ void taskLED(void* param) {
 // ─── ✅ Ping com timeout reduzido para não bloquear o botão ──────────────────
 bool pingInternet() {
   WiFiClient pingClient;
-  pingClient.setTimeout(1500);   // ✅ reduzido de 3s → 1.5s por host (total max 4.5s)
+  pingClient.setTimeout(800);    // 0.8s por host (total máx ~2.4s) — evita travar o loop()
   if (pingClient.connect("google.com", 80))     { pingClient.stop(); Serial.println("✅ Ping OK → google.com:80");  return true; }
   if (pingClient.connect("1.1.1.1", 80))        { pingClient.stop(); Serial.println("✅ Ping OK → 1.1.1.1:80");     return true; }
   if (pingClient.connect("208.67.222.222", 80)) { pingClient.stop(); Serial.println("✅ Ping OK → OpenDNS:80");     return true; }
@@ -529,14 +577,16 @@ void reconnectMQTT() {
   Serial.println("🔄 Reconectando MQTT...");
   if (client.connect(mqtt_id.c_str(), mqtt_username, mqtt_password)) {
     Serial.println("✅ MQTT conectado!");
-    client.subscribe(topic_cmd);      Serial.println("📋 Subscrito: " + topic_cmd);
-    client.subscribe(topic_estado);   Serial.println("📋 Subscrito: " + topic_estado);
-    client.subscribe(topic_setpoint); Serial.println("📋 Subscrito: " + topic_setpoint);
+    client.subscribe(topic_cmd,      1); Serial.println("📋 Subscrito: " + topic_cmd);
+    client.subscribe(topic_estado,   1); Serial.println("📋 Subscrito: " + topic_estado);
+    client.subscribe(topic_setpoint, 1); Serial.println("📋 Subscrito: " + topic_setpoint);
     modoAnterior   = -1;
     statusAnterior = -1;
     lerEPublicarEntradas();
     mqttPublish(topic_cmd,    releAtivado ? "true" : "false", true);
-    mqttPublish(topic_estado, estadoControladora == 1 ? "true" : "false", true);
+    // NÃO republicar topic_estado: ESTADO/SET é comando de entrada — só o SCADA escreve.
+    // A controladora apenas consome o retido do broker; o valor local é persistido na EEPROM.
+    client.publish(topic_online.c_str(), "1", true, 1); // confirma presença (retido, QoS 1)
   } else {
     Serial.printf("⚠️ MQTT falhou | erro: %d\n", client.lastError());
   }
@@ -548,16 +598,21 @@ void messageReceived(String &topic, String &payload) {
   Serial.printf("📩 RECEBIDO  [%s] → \"%s\"\n", topic.c_str(), payload.c_str());
 
   if (topic == topic_setpoint) {
-    setpoint = payload.toFloat();
-    Serial.printf("   🌡️  Setpoint → %.1f°C\n", setpoint);
+    float sp = payload.toFloat();
+    if (sp >= 10.0 && sp <= 35.0) {
+      if (fabs(sp - setpoint) > 0.01) { setpoint = sp; salvarSetpoint(); }
+      Serial.printf("   🌡️  Setpoint → %.1f°C\n", setpoint);
+    } else {
+      Serial.printf("   ⚠️ Setpoint fora da faixa (10–35°C): \"%s\" — ignorado\n", payload.c_str());
+    }
   }
   else if (topic == topic_estado) {
     if (payloadVerdadeiro(payload)) {
-      estadoControladora = 1;
-      Serial.println("   🔄 Controladora → HORÁRIO (07h liga / 21h desliga)");
+      if (estadoControladora != 1) { estadoControladora = 1; salvarEstadoCtrl(); }
+      Serial.println("   🔄 Controladora → HORÁRIO (agenda controla o relé)");
       aplicarHorario();
     } else if (payloadFalso(payload)) {
-      estadoControladora = 0;
+      if (estadoControladora != 0) { estadoControladora = 0; salvarEstadoCtrl(); }
       Serial.println("   🔄 Controladora → CMD (aguarda TJS/CMD/SET)");
     } else {
       Serial.printf("   ⚠️ ESTADO payload desconhecido: \"%s\"\n", payload.c_str());
@@ -588,7 +643,17 @@ float convertToPercentage(int v) { return (v / 255.0) * 100.0; }
 
 void vagPID() {
   sensors.requestTemperatures();
-  temperatura = sensors.getTempCByIndex(0);
+  float leitura = sensors.getTempCByIndex(0);
+
+  // DS18B20 retorna -127 em falha de comunicação e 85.0 no power-on reset
+  if (leitura <= -100.0 || leitura >= 84.0) {
+    Serial.printf("⚠️ Sensor DS18B20 FALHOU (leitura: %.1f°C) — PID suspenso\n", leitura);
+    analogWrite(PWM_PIN1, 0);
+    mqttPublish(topic_temperatura, "ERRO", false);
+    return;
+  }
+
+  temperatura = leitura;
 
   if (releAtivado) {
     pid1.Compute();
@@ -609,8 +674,10 @@ void vagPID() {
 
 // ─── SETUP ────────────────────────────────────────────────────────────────────
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
   EEPROM.begin(EEPROM_SIZE);
+  carregarAgenda();
+  carregarEstadoCtrl();
   sensors.begin();
 
   client.onMessage(messageReceived);
@@ -644,6 +711,7 @@ void setup() {
   topic_cmd         = prefix + "/CMD/SET";
   topic_estado      = prefix + "/ESTADO/SET";
   topic_setpoint    = prefix + "/SETPOINT/SET";
+  topic_online      = prefix + "/ONLINE";
 
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   Serial.println("🔧 CONTROLADORA HVAC | ID: " + mqtt_id + " | v" FIRMWARE_VERSION);
@@ -660,7 +728,7 @@ void setup() {
   wifiManager.setConfigPortalTimeout(300);
 
   // ✅ Task LED iniciada ANTES do autoConnect (que é bloqueante)
-  xTaskCreate(taskLED, "LED", 1024, NULL, 1, NULL);
+  xTaskCreate(taskLED, "LED", 2048, NULL, 1, NULL);
 
   // ✅ AP com nome incluindo ID da controladora
   String apNome = "AutoConnect_" + mqtt_id;
@@ -684,10 +752,12 @@ void setup() {
     Serial.println("⚠️ NTP não sincronizou no setup");
 
   client.begin(mqtt_server, net);
+  client.setKeepAlive(20);   // mais tolerante a bloqueios curtos do loop() (ping, reconnect)
+  client.setWill(topic_online.c_str(), "0", true, 1); // LWT: broker publica "0" retido se cair sem aviso
   reconnectMQTT();
 
-  carregarAgenda();
   if (estadoControladora == 1) aplicarHorario();
+  else if (EEPROM.read(ADDR_RELE1) == RELE_LIGADO) ligarRele("restauro pós-boot (modo CMD)");
 
   pingOK = pingInternet();
   if (pingOK) ultimoPingOK = millis();
@@ -699,7 +769,11 @@ void loop() {
   client.loop();
   delay(10);
 
-  if (!client.connected()) reconnectMQTT();
+  static unsigned long tReconnect = 0;
+  if (!client.connected() && millis() - tReconnect >= 5000UL) {
+    tReconnect = millis();
+    reconnectMQTT();
+  }
 
   lerEPublicarEntradas();
 
@@ -708,7 +782,7 @@ void loop() {
 
   // LED controlado pela taskLED (FreeRTOS) — independente do loop()
 
-  if (millis() - tsPing >= 30000UL) {
+  if (millis() - tsPing >= 60000UL) {
     tsPing = millis();
     pingOK = pingInternet();
     if (pingOK) ultimoPingOK = millis();
