@@ -4,6 +4,7 @@
 #include <PID_v1.h>
 #include <DallasTemperature.h>
 #include <EEPROM.h>
+#include <Preferences.h>
 #include <WiFiManager.h>
 #include <time.h>
 #include <math.h>
@@ -35,6 +36,8 @@ String topic_cmd;
 String topic_estado;
 String topic_setpoint;
 String topic_online;
+String topic_schedule;
+String topic_schedule_state;
 
 // ─── Hardware ─────────────────────────────────────────────────────────────────
 #define ONE_WIRE_BUS    13
@@ -57,14 +60,12 @@ String topic_online;
 
 #define EEPROM_SIZE       16
 #define ADDR_RELE1        0
-#define ADDR_DIAS         1   // bitmap: bit0=Dom, bit1=Seg ... bit6=Sáb
-#define ADDR_HORA_LIGA    2   // hora de ligar (0–23)
-#define ADDR_HORA_DESLIGA 3   // hora de desligar (0–23)
-#define ADDR_ESTADO_CTRL  4   // estadoControladora (0=CMD, 1=HORÁRIO)
+// endereços 1–3: livres (antiga janela horária local — agenda agora vem só do supervisório, no NVS)
+#define ADDR_ESTADO_CTRL  4   // estadoControladora (0=FORÇADO, 1=AUTOMÁTICO)
 #define ADDR_SETPOINT     8   // float (4 bytes) — setpoint persistido
 
 // ─── Versão do firmware ───────────────────────────────────────────────────────
-#define FIRMWARE_VERSION "1.0.1"
+#define FIRMWARE_VERSION "1.1.0"
 
 // ─── OTA ──────────────────────────────────────────────────────────────────────
 WebServer otaServer(80);
@@ -91,13 +92,28 @@ unsigned long tsPing       = 0;
 unsigned long ultimoPingOK = 0;
 volatile bool pingOK = false;   // escrito no loop, lido na taskLED
 
-// ─── Agenda (carregada da EEPROM) ─────────────────────────────────────────────
-uint8_t schedDias        = 0b00111110; // padrão: Seg–Sex (bits 1–5)
-uint8_t schedHoraLiga    = 7;
-uint8_t schedHoraDesliga = 21;
+// ─── Agenda semanal (recebida do supervisório via MQTT, persistida no NVS) ────
+// Payload: uma linha por slot  IDX;HH:MM;DIAS;ACAO;VALOR;EN  (vazio = apagar tudo)
+enum AcaoAgenda : uint8_t { ACAO_ESTADO, ACAO_CMD, ACAO_SETPOINT };
+
+struct SlotAgenda {
+  uint8_t hora;
+  uint8_t minuto;
+  uint8_t dias;    // bitmap: bit0=Dom ... bit6=Sáb
+  uint8_t acao;    // AcaoAgenda
+  float   valor;   // ESTADO/CMD: 1=true 0=false | SETPOINT: °C
+};
+
+#define MAX_SLOTS 10
+SlotAgenda  slots[MAX_SLOTS];
+int         nSlots            = 0;
+String      agendaPayload     = "";    // última agenda aplicada (texto bruto, é o que vai pro NVS)
+long        agendaUltimaChave = -1;    // ano/dia/minuto já processado — evita re-disparo no mesmo minuto
+bool        agendaCatchupPendente = false;   // aplicar o estado esperado assim que houver hora válida (boot / agenda nova)
+Preferences prefs;
 
 WiFiClient        net;
-MQTTClient        client;
+MQTTClient        client(1024);   // padrão da lib é 128 bytes — 10 slots passam de 250 e seriam descartados
 OneWire           oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 WiFiManager       wifiManager;
@@ -116,27 +132,6 @@ void salvarRele(int estado) {
   EEPROM.commit();
 }
 
-void salvarAgenda() {
-  EEPROM.write(ADDR_DIAS,         schedDias);
-  EEPROM.write(ADDR_HORA_LIGA,    schedHoraLiga);
-  EEPROM.write(ADDR_HORA_DESLIGA, schedHoraDesliga);
-  EEPROM.commit();
-  Serial.printf("💾 Agenda salva | dias=0b%08b | liga=%02dh | desliga=%02dh\n",
-                schedDias, schedHoraLiga, schedHoraDesliga);
-}
-
-void carregarAgenda() {
-  uint8_t d = EEPROM.read(ADDR_DIAS);
-  uint8_t h = EEPROM.read(ADDR_HORA_LIGA);
-  uint8_t f = EEPROM.read(ADDR_HORA_DESLIGA);
-  // 0xFF = EEPROM virgem → aplicar padrão Seg–Sex 07h–21h
-  schedDias        = (d == 0xFF)           ? 0b00111110 : d;
-  schedHoraLiga    = (h == 0xFF || h > 23) ? 7          : h;
-  schedHoraDesliga = (f == 0xFF || f > 23) ? 21         : f;
-  Serial.printf("📂 Agenda carregada | dias=0b%08b | liga=%02dh | desliga=%02dh\n",
-                schedDias, schedHoraLiga, schedHoraDesliga);
-}
-
 // ─── EEPROM: estado da controladora + setpoint ───────────────────────────────
 void salvarEstadoCtrl() {
   EEPROM.write(ADDR_ESTADO_CTRL, (uint8_t)estadoControladora);
@@ -151,14 +146,14 @@ void salvarSetpoint() {
 
 void carregarEstadoCtrl() {
   uint8_t e = EEPROM.read(ADDR_ESTADO_CTRL);
-  estadoControladora = (e == 0xFF) ? 1 : (e ? 1 : 0);   // EEPROM virgem → HORÁRIO
+  estadoControladora = (e == 0xFF) ? 1 : (e ? 1 : 0);   // EEPROM virgem → AUTOMÁTICO
 
   float sp;
   EEPROM.get(ADDR_SETPOINT, sp);
   setpoint = (isnan(sp) || sp < 10.0 || sp > 35.0) ? 23.0 : sp;
 
   Serial.printf("📂 Estado carregado | modo=%s | setpoint=%.1f°C\n",
-                estadoControladora == 1 ? "HORÁRIO" : "CMD", setpoint);
+                estadoControladora == 1 ? "AUTOMÁTICO" : "FORÇADO", setpoint);
 }
 
 // ─── MQTT publish com log ─────────────────────────────────────────────────────
@@ -211,91 +206,9 @@ void entrarModoOTA() {
       "<p><b>IP AP:</b> " + WiFi.softAPIP().toString() + "</p>"
       "<br>"
       "<a class='btn' href='/update'>📦 Atualizar Firmware</a><br>"
-      "<a class='btn btn2' href='/config'>⏱️ Configurar Agenda</a><br>"
       "<a class='btn btn4' href='/mqtt-test'>🔌 Testar Conexão MQTT</a><br>"
       "<a class='btn btn3' href='/restart' onclick=\"return confirm('Reiniciar a controladora?')\">🔄 Reiniciar Controladora</a><br>"
       "<a class='btn btn2' href='/exit' onclick=\"return confirm('Sair do modo OTA e voltar à operação normal?')\">✅ Sair do modo OTA</a>"
-      "</body></html>";
-    otaServer.send(200, "text/html", html);
-  });
-
-  // ── Página de configuração de agenda ────────────────────────────────────────
-  otaServer.on("/config", HTTP_GET, []() {
-    // Monta checkboxes pré-marcados conforme schedDias
-    // bit0=Dom, bit1=Seg, bit2=Ter, bit3=Qua, bit4=Qui, bit5=Sex, bit6=Sáb
-    const char* nomes[] = {"Dom","Seg","Ter","Qua","Qui","Sex","S&aacute;b"};
-    const char* ids[]   = {"dom","seg","ter","qua","qui","sex","sab"};
-    String checkboxes = "";
-    for (int i = 0; i < 7; i++) {
-      bool marcado = (schedDias >> i) & 1;
-      checkboxes += "<label style='margin:6px;font-size:18px'>"
-                    "<input type='checkbox' name='" + String(ids[i]) + "' value='1'" +
-                    (marcado ? " checked" : "") +
-                    "> " + nomes[i] + "</label> ";
-    }
-    String html =
-      "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
-      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-      "<style>body{font-family:sans-serif;text-align:center;padding:20px}"
-      "h2{color:#333}label{display:inline-block;margin:4px}"
-      ".bloco{background:#f4f4f4;border-radius:8px;padding:16px;margin:12px auto;max-width:400px}"
-      "input[type=number]{width:60px;font-size:20px;text-align:center;padding:4px}"
-      ".btn{display:inline-block;padding:12px 32px;margin-top:16px;"
-      "background:#28a745;color:white;border:none;border-radius:6px;"
-      "font-size:18px;cursor:pointer}"
-      ".voltar{display:inline-block;margin-top:12px;color:#0078d4;font-size:14px}"
-      "</style></head><body>"
-      "<h2>⏱️ Configurar Agenda</h2>"
-      "<p><b>ID:</b> " + mqtt_id + "</p>"
-      "<form method='POST' action='/config/save'>"
-      "<div class='bloco'>"
-      "<b>Dias ativos:</b><br><br>" + checkboxes +
-      "</div>"
-      "<div class='bloco'>"
-      "<b>Hora ligar:</b> "
-      "<input type='number' name='hliga' min='0' max='23' value='" + String(schedHoraLiga) + "'> h"
-      "&nbsp;&nbsp;&nbsp;"
-      "<b>Hora desligar:</b> "
-      "<input type='number' name='hdesliga' min='0' max='23' value='" + String(schedHoraDesliga) + "'> h"
-      "</div>"
-      "<button class='btn' type='submit'>💾 Salvar</button>"
-      "</form>"
-      "<br><a class='voltar' href='/'>← Voltar</a>"
-      "</body></html>";
-    otaServer.send(200, "text/html", html);
-  });
-
-  // ── Salvar configuração de agenda ───────────────────────────────────────────
-  otaServer.on("/config/save", HTTP_POST, []() {
-    // Monta bitmap de dias
-    uint8_t dias = 0;
-    const char* ids[] = {"dom","seg","ter","qua","qui","sex","sab"};
-    for (int i = 0; i < 7; i++) {
-      if (otaServer.hasArg(ids[i])) dias |= (1 << i);
-    }
-    schedDias = dias;
-
-    // Lê horários
-    if (otaServer.hasArg("hliga")) {
-      int v = otaServer.arg("hliga").toInt();
-      if (v >= 0 && v <= 23) schedHoraLiga = v;
-    }
-    if (otaServer.hasArg("hdesliga")) {
-      int v = otaServer.arg("hdesliga").toInt();
-      if (v >= 0 && v <= 23) schedHoraDesliga = v;
-    }
-
-    salvarAgenda();
-
-    // Redireciona para /config com banner de sucesso
-    String html =
-      "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
-      "<meta http-equiv='refresh' content='2;url=/config'>"
-      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-      "<style>body{font-family:sans-serif;text-align:center;padding:40px}"
-      ".ok{background:#d4edda;border-radius:8px;padding:20px;font-size:20px}"
-      "</style></head><body>"
-      "<div class='ok'>✅ Agenda salva!<br><small>Redirecionando...</small></div>"
       "</body></html>";
     otaServer.send(200, "text/html", html);
   });
@@ -397,40 +310,6 @@ void entrarModoOTA() {
   ESP.restart();
 }
 
-// ─── Horário NTP ──────────────────────────────────────────────────────────────
-bool dentroDoHorario() {
-  struct tm t;
-  if (!getLocalTime(&t)) {
-    Serial.println("⚠️ NTP indisponível — retornando false");
-    return false;
-  }
-  // tm_wday: 0=Dom 1=Seg 2=Ter 3=Qua 4=Qui 5=Sex 6=Sáb
-  const char* diasSemana[] = {"Dom","Seg","Ter","Qua","Qui","Sex","Sáb"};
-  bool diaAtivo = (schedDias >> t.tm_wday) & 1;
-  bool horario;
-  if (schedHoraLiga == schedHoraDesliga) {
-    // liga == desliga → sem janela válida, desligado o dia todo
-    horario = false;
-  } else if (schedHoraDesliga == 0) {
-    // desliga=0 significa meia-noite → liga das X até 23h59
-    horario = (t.tm_hour >= schedHoraLiga);
-  } else if (schedHoraDesliga > schedHoraLiga) {
-    // normal: liga das X até Y no mesmo dia
-    horario = (t.tm_hour >= schedHoraLiga && t.tm_hour < schedHoraDesliga);
-  } else {
-    // cruza meia-noite: ex. liga 22h desliga 06h
-    horario = (t.tm_hour >= schedHoraLiga || t.tm_hour < schedHoraDesliga);
-  }
-  bool dentro = diaAtivo && horario;
-  Serial.printf("🕐 %s %02d:%02d | Dia ativo: %s | Janela %02dh-%02dh: %s → %s\n",
-                diasSemana[t.tm_wday], t.tm_hour, t.tm_min,
-                diaAtivo ? "SIM" : "NÃO",
-                schedHoraLiga, schedHoraDesliga,
-                horario ? "SIM" : "NÃO",
-                dentro  ? "DENTRO" : "FORA");
-  return dentro;
-}
-
 // ─── Liga relé ────────────────────────────────────────────────────────────────
 void ligarRele(const char* motivo) {
   Serial.printf("🔌 ligarRele() | motivo: %s | releAtivado: %s\n",
@@ -462,11 +341,224 @@ void desligarRele(const char* motivo) {
   mqttPublish(topic_cmd, "false", true);
 }
 
-// ─── Aplica horário ───────────────────────────────────────────────────────────
-void aplicarHorario() {
-  Serial.println("📅 aplicarHorario()");
-  if (dentroDoHorario()) ligarRele("ESTADO=1 dentro da janela agendada");
-  else                   desligarRele("ESTADO=1 fora da janela agendada");
+// ─── Agenda: parser ───────────────────────────────────────────────────────────
+// Divide `s` por `sep` em até `max` campos; devolve quantos foram encontrados
+static int dividir(const String& s, char sep, String* out, int max) {
+  int n = 0, ini = 0;
+  while (n < max) {
+    int fim = s.indexOf(sep, ini);
+    if (fim < 0) { out[n++] = s.substring(ini); break; }
+    out[n++] = s.substring(ini, fim);
+    ini = fim + 1;
+  }
+  return n;
+}
+
+static bool apenasDigitos(const String& s) {
+  if (s.length() == 0) return false;
+  for (unsigned i = 0; i < s.length(); i++) if (!isDigit(s[i])) return false;
+  return true;
+}
+
+// 1 = slot válido e ativo | 0 = válido mas desativado (EN=0) | -1 = malformado
+static int parseLinhaAgenda(const String& linha, SlotAgenda& s) {
+  String c[7];
+  if (dividir(linha, ';', c, 7) != 6) return -1;
+  for (int i = 0; i < 6; i++) c[i].trim();
+
+  if (c[5] != "0" && c[5] != "1") return -1;                       // EN
+
+  int dp = c[1].indexOf(':');                                      // HH:MM
+  if (dp < 0) return -1;
+  String hh = c[1].substring(0, dp), mm = c[1].substring(dp + 1);
+  if (!apenasDigitos(hh) || !apenasDigitos(mm)) return -1;
+  int h = hh.toInt(), m = mm.toInt();
+  if (h > 23 || m > 59) return -1;
+
+  uint8_t dias = 0;                                                // DIAS
+  if (c[2] == "*") {
+    dias = 0x7F;
+  } else {
+    String d[8];
+    int nd = dividir(c[2], ',', d, 8);
+    for (int i = 0; i < nd; i++) {
+      d[i].trim();
+      if (!apenasDigitos(d[i]) || d[i].toInt() > 6) return -1;
+      dias |= (1 << d[i].toInt());
+    }
+  }
+
+  c[3].trim(); c[3].toUpperCase();                                 // ACAO
+  if      (c[3] == "ESTADO")   s.acao = ACAO_ESTADO;
+  else if (c[3] == "CMD")      s.acao = ACAO_CMD;
+  else if (c[3] == "SETPOINT") s.acao = ACAO_SETPOINT;
+  else return -1;
+
+  if (s.acao == ACAO_SETPOINT) {                                   // VALOR
+    char* fim;
+    float v = strtof(c[4].c_str(), &fim);
+    if (c[4].length() == 0 || *fim != '\0' || isnan(v)) return -1;
+    s.valor = constrain(v, 10.0f, 35.0f);
+  } else {
+    c[4].toLowerCase();
+    if      (payloadVerdadeiro(c[4])) s.valor = 1;
+    else if (payloadFalso(c[4]))      s.valor = 0;
+    else return -1;
+  }
+
+  s.hora = h; s.minuto = m; s.dias = dias;
+  return (c[5] == "1") ? 1 : 0;
+}
+
+// Substitui a lista inteira (sem merge). Devolve a quantidade de slots ativos.
+static int interpretarAgenda(const String& payload) {
+  nSlots = 0;
+  int ini = 0;
+  while (ini <= (int)payload.length()) {
+    int fim = payload.indexOf('\n', ini);
+    if (fim < 0) fim = payload.length();
+    String linha = payload.substring(ini, fim);
+    ini = fim + 1;
+    linha.trim();
+    if (linha.length() == 0) continue;
+
+    SlotAgenda s;
+    int r = parseLinhaAgenda(linha, s);
+    if (r < 0)  { Serial.printf("⚠️ Agenda: linha malformada ignorada: \"%s\"\n", linha.c_str()); continue; }
+    if (r == 0) { Serial.printf("ℹ️ Agenda: slot desativado (EN=0) ignorado: \"%s\"\n", linha.c_str()); continue; }
+    if (nSlots >= MAX_SLOTS) { Serial.printf("⚠️ Agenda: acima de %d slots, ignorado: \"%s\"\n", MAX_SLOTS, linha.c_str()); continue; }
+    slots[nSlots++] = s;
+  }
+  return nSlots;
+}
+
+// Lista aplicada, no mesmo formato recebido (IDX renumerado de 0)
+static String descreverAgenda() {
+  String out;
+  for (int i = 0; i < nSlots; i++) {
+    const SlotAgenda& s = slots[i];
+    String dias;
+    if (s.dias == 0x7F) dias = "*";
+    else for (int d = 0; d < 7; d++) if ((s.dias >> d) & 1) { if (dias.length()) dias += ','; dias += String(d); }
+    const char* acao = (s.acao == ACAO_ESTADO) ? "ESTADO" : (s.acao == ACAO_CMD) ? "CMD" : "SETPOINT";
+    String valor = (s.acao == ACAO_SETPOINT) ? String(s.valor, 1) : String(s.valor > 0 ? "true" : "false");
+    char hm[6];
+    snprintf(hm, sizeof(hm), "%02d:%02d", s.hora, s.minuto);
+    if (i) out += '\n';
+    out += String(i) + ";" + hm + ";" + dias + ";" + acao + ";" + valor + ";1";
+  }
+  return out;
+}
+
+static void publicarEstadoAgenda() {
+  mqttPublish(topic_schedule_state, descreverAgenda(), true);   // vazio → limpa o retained
+}
+
+// ─── Agenda: persistência (NVS) ───────────────────────────────────────────────
+static void salvarAgendaNVS() {
+  prefs.begin("hvac", false);
+  prefs.putString("agenda", agendaPayload);
+  prefs.end();
+}
+
+static void carregarAgendaNVS() {
+  prefs.begin("hvac", false);
+  agendaPayload = prefs.getString("agenda", "");
+  prefs.end();
+  int n = interpretarAgenda(agendaPayload);
+  Serial.printf("📂 Agenda carregada do NVS | %d slot(s)\n", n);
+  if (n) Serial.println(descreverAgenda());
+  agendaCatchupPendente = (n > 0);
+}
+
+// ─── Agenda: execução ─────────────────────────────────────────────────────────
+// Aplica direto nas funções internas (funciona sem broker) e publica o novo estado retido
+// para o supervisório acompanhar e para o retained não reverter o modo no próximo boot.
+static void definirEstado(bool automatico) {
+  int novo = automatico ? 1 : 0;
+  if (estadoControladora != novo) { estadoControladora = novo; salvarEstadoCtrl(); }
+  mqttPublish(topic_estado, automatico ? "true" : "false", true);
+}
+
+static void executarSlot(const SlotAgenda& s) {
+  static const char* nomes[] = {"ESTADO", "CMD", "SETPOINT"};
+  Serial.printf("⏰ AGENDA %02d:%02d → %s = %.1f\n", s.hora, s.minuto, nomes[s.acao], s.valor);
+  switch (s.acao) {
+    case ACAO_ESTADO:
+      definirEstado(s.valor > 0);
+      break;
+    case ACAO_CMD:
+      definirEstado(false);   // CMD só vale em modo FORÇADO
+      if (s.valor > 0) ligarRele("agenda");
+      else             desligarRele("agenda");
+      break;
+    case ACAO_SETPOINT:
+      if (fabs(s.valor - setpoint) > 0.01) { setpoint = s.valor; salvarSetpoint(); }
+      mqttPublish(topic_setpoint, String(setpoint, 1), true);
+      break;
+  }
+}
+
+// Aplica o último evento já passado de cada ação (até 7 dias atrás), do mais antigo ao mais novo.
+// Cobre queda de energia (boot às 07:05 com slot das 07:00) e agenda recém-recebida.
+static void recuperarEstadoAgenda(const struct tm& t) {
+  int  agora = t.tm_hour * 60 + t.tm_min;
+  long ago[3] = {-1, -1, -1};   // minutos desde o último evento de cada ação
+  int  idx[3] = {-1, -1, -1};   // slot correspondente
+
+  for (int i = 0; i < nSlots; i++) {
+    const SlotAgenda& s = slots[i];
+    for (int volta = 0; volta <= 7; volta++) {
+      long min = (long)volta * 1440 + agora - (s.hora * 60 + s.minuto);
+      if (min < 0) continue;                                            // ainda não chegou hoje
+      if (!((s.dias >> (((t.tm_wday - volta) % 7 + 7) % 7)) & 1)) continue;
+      if (ago[s.acao] < 0 || min < ago[s.acao]) { ago[s.acao] = min; idx[s.acao] = i; }
+      break;                                                            // ocorrência mais recente deste slot
+    }
+  }
+
+  bool feito[3] = {false, false, false};
+  for (int k = 0; k < 3; k++) {
+    int melhor = -1;
+    for (int a = 0; a < 3; a++)
+      if (!feito[a] && idx[a] >= 0 && (melhor < 0 || ago[a] > ago[melhor])) melhor = a;
+    if (melhor < 0) break;
+    feito[melhor] = true;
+    executarSlot(slots[idx[melhor]]);
+  }
+}
+
+// Chamar a cada iteração do loop(): checa 1x por segundo
+void verificarAgenda() {
+  static unsigned long tCheck = 0, tAviso = 0;
+  if (millis() - tCheck < 1000UL) return;
+  tCheck = millis();
+  if (nSlots == 0) return;
+
+  struct tm t;
+  if (!getLocalTime(&t, 0)) {   // timeout 0: sem NTP não pode travar o loop
+    if (millis() - tAviso >= 60000UL) {
+      tAviso = millis();
+      Serial.println("⚠️ Agenda suspensa — relógio NTP ainda não sincronizado");
+    }
+    return;
+  }
+
+  long chave = ((long)t.tm_year * 366L + t.tm_yday) * 1440L + t.tm_hour * 60 + t.tm_min;
+  if (agendaCatchupPendente) {
+    agendaCatchupPendente = false;
+    agendaUltimaChave = chave;              // slots deste minuto já entram na recuperação
+    Serial.println("🔁 Agenda: aplicando o estado esperado para o horário atual");
+    recuperarEstadoAgenda(t);
+    return;
+  }
+  if (chave == agendaUltimaChave) return;   // este minuto já foi processado
+  agendaUltimaChave = chave;
+
+  for (int i = 0; i < nSlots; i++) {
+    const SlotAgenda& s = slots[i];
+    if (s.hora == t.tm_hour && s.minuto == t.tm_min && ((s.dias >> t.tm_wday) & 1)) executarSlot(s);
+  }
 }
 
 // ─── Entradas digitais → publica se mudou ────────────────────────────────────
@@ -580,6 +672,7 @@ void reconnectMQTT() {
     client.subscribe(topic_cmd,      1); Serial.println("📋 Subscrito: " + topic_cmd);
     client.subscribe(topic_estado,   1); Serial.println("📋 Subscrito: " + topic_estado);
     client.subscribe(topic_setpoint, 1); Serial.println("📋 Subscrito: " + topic_setpoint);
+    client.subscribe(topic_schedule, 1); Serial.println("📋 Subscrito: " + topic_schedule);
     modoAnterior   = -1;
     statusAnterior = -1;
     lerEPublicarEntradas();
@@ -587,6 +680,7 @@ void reconnectMQTT() {
     // NÃO republicar topic_estado: ESTADO/SET é comando de entrada — só o SCADA escreve.
     // A controladora apenas consome o retido do broker; o valor local é persistido na EEPROM.
     client.publish(topic_online.c_str(), "1", true, 1); // confirma presença (retido, QoS 1)
+    publicarEstadoAgenda();
   } else {
     Serial.printf("⚠️ MQTT falhou | erro: %d\n", client.lastError());
   }
@@ -609,18 +703,30 @@ void messageReceived(String &topic, String &payload) {
   else if (topic == topic_estado) {
     if (payloadVerdadeiro(payload)) {
       if (estadoControladora != 1) { estadoControladora = 1; salvarEstadoCtrl(); }
-      Serial.println("   🔄 Controladora → HORÁRIO (agenda controla o relé)");
-      aplicarHorario();
+      Serial.println("   🔄 Controladora → AUTOMÁTICO (CMD manual ignorado)");
     } else if (payloadFalso(payload)) {
       if (estadoControladora != 0) { estadoControladora = 0; salvarEstadoCtrl(); }
-      Serial.println("   🔄 Controladora → CMD (aguarda TJS/CMD/SET)");
+      Serial.println("   🔄 Controladora → FORÇADO (aceita TJS/CMD/SET)");
     } else {
       Serial.printf("   ⚠️ ESTADO payload desconhecido: \"%s\"\n", payload.c_str());
     }
   }
+  else if (topic == topic_schedule) {
+    if (payload == agendaPayload) {
+      Serial.println("   ℹ️ Agenda idêntica à salva — nada a gravar");
+    } else {
+      agendaPayload = payload;
+      int n = interpretarAgenda(agendaPayload);
+      salvarAgendaNVS();
+      Serial.printf("   📅 Agenda substituída | %d slot(s) ativo(s)\n", n);
+      if (n) Serial.println(descreverAgenda());
+      agendaCatchupPendente = (n > 0);
+    }
+    publicarEstadoAgenda();
+  }
   else if (topic == topic_cmd) {
     Serial.printf("   🔘 CMD | estadoControladora=%d (%s)\n",
-                  estadoControladora, estadoControladora == 1 ? "HORÁRIO" : "CMD");
+                  estadoControladora, estadoControladora == 1 ? "AUTOMÁTICO" : "FORÇADO");
     if (estadoControladora == 0) {
       if (payloadVerdadeiro(payload))      ligarRele("CMD/SET = LIGAR");
       else if (payloadFalso(payload))      desligarRele("CMD/SET = DESLIGAR");
@@ -676,7 +782,7 @@ void vagPID() {
 void setup() {
   Serial.begin(115200);
   EEPROM.begin(EEPROM_SIZE);
-  carregarAgenda();
+  carregarAgendaNVS();
   carregarEstadoCtrl();
   sensors.begin();
 
@@ -712,6 +818,8 @@ void setup() {
   topic_estado      = prefix + "/ESTADO/SET";
   topic_setpoint    = prefix + "/SETPOINT/SET";
   topic_online      = prefix + "/ONLINE";
+  topic_schedule       = prefix + "/SCHEDULE/SET";
+  topic_schedule_state = prefix + "/SCHEDULE/STATE";
 
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   Serial.println("🔧 CONTROLADORA HVAC | ID: " + mqtt_id + " | v" FIRMWARE_VERSION);
@@ -756,8 +864,8 @@ void setup() {
   client.setWill(topic_online.c_str(), "0", true, 1); // LWT: broker publica "0" retido se cair sem aviso
   reconnectMQTT();
 
-  if (estadoControladora == 1) aplicarHorario();
-  else if (EEPROM.read(ADDR_RELE1) == RELE_LIGADO) ligarRele("restauro pós-boot (modo CMD)");
+  // Sem janela local: restaura o último estado do relé; a agenda corrige no próximo evento
+  if (EEPROM.read(ADDR_RELE1) == RELE_LIGADO) ligarRele("restauro pós-boot");
 
   pingOK = pingInternet();
   if (pingOK) ultimoPingOK = millis();
@@ -780,6 +888,8 @@ void loop() {
   // ✅ Botão em função separada — chamado a cada iteração do loop
   verificarBotaoWifi();
 
+  verificarAgenda();
+
   // LED controlado pela taskLED (FreeRTOS) — independente do loop()
 
   if (millis() - tsPing >= 60000UL) {
@@ -800,9 +910,8 @@ void loop() {
     ts1 = millis();
     Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     Serial.printf("🔁 CICLO 30s | ESTADO: %s | Relé: %s\n",
-                  estadoControladora == 1 ? "HORÁRIO" : "CMD",
+                  estadoControladora == 1 ? "AUTOMÁTICO" : "FORÇADO",
                   releAtivado ? "LIGADO" : "DESLIGADO");
-    if (estadoControladora == 1) aplicarHorario();
     vagPID();
     Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   }
