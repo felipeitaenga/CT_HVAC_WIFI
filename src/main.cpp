@@ -50,7 +50,10 @@ const unsigned long MQTT_RETRY_MS        = 5000UL;      // a) MQTT caiu com Wi-F
 const unsigned long WIFI_RECONNECT_MS    = 30000UL;     // b) Wi-Fi fora > 30 s → WiFi.reconnect()
 const unsigned long WIFI_RESET_PILHA_MS  = 180000UL;    // c) Wi-Fi fora > 3 min → reinicia a pilha Wi-Fi (repete a cada 3 min)
 const unsigned long MQTT_RESET_PILHA_MS  = 600000UL;    //    MQTT fora > 10 min com Wi-Fi OK → também reinicia a pilha (degrau c)
-const unsigned long MQTT_REINICIO_MS     = 1800000UL;   // d) MQTT fora > 30 min com Wi-Fi OK e c já tentado → reinício suave
+// d) MQTT fora com Wi-Fi OK e c já tentado → reinício suave. O limite cresce com os reinícios
+//    seguidos sem resolver (rtcEstado.reiniciosMqtt): 1º após 30 min, 2º após 2 h, e dali em
+//    diante a cada 4 h. Zera quando o MQTT conecta.
+const unsigned long INTERVALOS_REINICIO_MS[] = {1800000UL, 7200000UL, 14400000UL};  // 30 min, 2 h, 4 h
 const unsigned long PING_MS              = 60000UL;     // ping só para LED/diagnóstico
 const unsigned long DIAG_MS              = 300000UL;    // RSSI e UPTIME a cada 5 min
 const uint32_t      WDT_TIMEOUT_S        = 60;          // watchdog do loop principal
@@ -116,7 +119,7 @@ String topic_uptime;          // TJS/<id>/UPTIME  — minutos (retido, a cada 5 
 #define ADDR_PRESSAO     12   // float (4 bytes) — setpoint de pressão (%) persistido
 
 // ─── Versão do firmware ───────────────────────────────────────────────────────
-#define FIRMWARE_VERSION "1.3.0"
+#define FIRMWARE_VERSION "1.3.1"
 
 // ─── OTA ──────────────────────────────────────────────────────────────────────
 // Senha do AP OTA e do ElegantOTA (usuário "admin"). Mínimo 8 caracteres (WPA2).
@@ -202,6 +205,8 @@ struct EstadoRTC {
   float    pressaoAplicada;
   float    vagPid;
   char     motivo[24];        // motivo próprio do reinício suave ("" = nenhum)
+  uint8_t  reiniciosMqtt;     // reinícios seguidos pelo degrau d sem resolver
+  uint8_t  bootsRuins;        // resets seguidos por PANIC/INT_WDT/TASK_WDT/WDT/BROWNOUT
   uint32_t checksum;
 };
 RTC_NOINIT_ATTR EstadoRTC rtcEstado;
@@ -222,6 +227,7 @@ void salvarRTC() {
   rtcEstado.pressaoAplicada = pressaoAplicada;
   rtcEstado.vagPid          = (float)vagPid;
   rtcEstado.motivo[sizeof(rtcEstado.motivo) - 1] = '\0';
+  // reiniciosMqtt / bootsRuins vivem direto em rtcEstado: não são sobrescritos aqui
   rtcEstado.checksum        = checksumRTC();
 }
 
@@ -970,6 +976,10 @@ void verificarRede() {
     if (client.connected()) {
       tsMqttOK = agora;
       pilhaResetadaSemMqtt = false;
+      if (rtcEstado.reiniciosMqtt != 0) {   // problema resolvido: degrau d volta para 30 min
+        rtcEstado.reiniciosMqtt = 0;
+        salvarRTC();
+      }
       return;
     }
 
@@ -985,10 +995,13 @@ void verificarRede() {
     unsigned long semMqtt = agora - tsMqttOK;
     if (semMqtt > MQTT_RESET_PILHA_MS && !pilhaResetadaSemMqtt) {
       reiniciarPilhaWifi("MQTT fora > 10 min com Wi-Fi OK");
-    } else if (semMqtt > MQTT_REINICIO_MS && pilhaResetadaSemMqtt &&
-               agora - tsResetPilha > WIFI_RESET_PILHA_MS) {
-      Serial.println("❌ [d] MQTT fora > 30 min com Wi-Fi OK e degraus a–c esgotados");
-      reinicioSuave("MQTT_30MIN");
+    } else if (semMqtt > INTERVALOS_REINICIO_MS[min<uint8_t>(rtcEstado.reiniciosMqtt, 2)] &&
+               pilhaResetadaSemMqtt && agora - tsResetPilha > WIFI_RESET_PILHA_MS) {
+      if (rtcEstado.reiniciosMqtt < 255) rtcEstado.reiniciosMqtt++;
+      Serial.printf("❌ [d] MQTT fora há %lu min — reinício suave nº %u (próximo intervalo: %lu min)\n",
+                    semMqtt / 60000UL, rtcEstado.reiniciosMqtt,
+                    INTERVALOS_REINICIO_MS[min<uint8_t>(rtcEstado.reiniciosMqtt, 2)] / 60000UL);
+      reinicioSuave("MQTT_SEM_CONEXAO");     // grava a RTC (com o contador) antes de reiniciar
     }
     return;
   }
@@ -1151,7 +1164,8 @@ void vagPID() {
 static bool restaurarSaidas(esp_reset_reason_t rr) {
   bool quente = (rr == ESP_RST_SW || rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT ||
                  rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT);
-  bool rtcOk = quente && rtcEstado.magic == RTC_MAGIC && rtcEstado.checksum == checksumRTC() &&
+  bool rtcValido = rtcEstado.magic == RTC_MAGIC && rtcEstado.checksum == checksumRTC();
+  bool rtcOk = quente && rtcValido &&
                rtcEstado.rele <= 1 && rtcEstado.estado <= 1 &&
                rtcEstado.vagAtuador >= 0.0f && rtcEstado.vagAtuador <= 100.0f &&
                rtcEstado.vagPid >= 0.0f && rtcEstado.vagPid <= 100.0f &&
@@ -1170,6 +1184,25 @@ static bool restaurarSaidas(esp_reset_reason_t rr) {
     vagAtuador      = 0;
     vagPid          = 0;
     pressaoAplicada = releAtivado ? max(pressaoSetpoint, PRESSAO_MIN_LIGADO) : 0.0f;
+  }
+
+  // Contadores de reinícios seguidos (sobrevivem na RTC; zeram em falta de energia ou RTC inválida)
+  if (!rtcValido || rr == ESP_RST_POWERON) {
+    rtcEstado.reiniciosMqtt = 0;
+    rtcEstado.bootsRuins    = 0;
+  }
+  if (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT ||
+      rr == ESP_RST_WDT || rr == ESP_RST_BROWNOUT) {
+    if (rtcEstado.bootsRuins < 255) rtcEstado.bootsRuins++;
+  }
+  if (rtcEstado.bootsRuins >= 3) motivoReset += " / BOOTLOOP " + String(rtcEstado.bootsRuins);
+
+  // Brownouts seguidos: não religa o fancoil (decidido ANTES de escrever os pinos — sem pulso)
+  if (rr == ESP_RST_BROWNOUT && rtcEstado.bootsRuins >= 2) {
+    releAtivado     = false;
+    vagAtuador      = 0;
+    pressaoAplicada = 0;
+    motivoReset += " / RELE_BLOQUEADO";
   }
 
   // Nível escrito ANTES de habilitar a saída: o pino já nasce no estado certo.
@@ -1208,6 +1241,8 @@ void setup() {
                 releAtivado ? "LIGADO" : "DESLIGADO", vagAtuador, pressaoAplicada);
   Serial.printf("📂 Estado | modo=%s | setpoint=%.1f°C | pressão salva=%.1f%%\n",
                 estadoControladora == 1 ? "AUTOMÁTICO" : "FORÇADO", setpoint, pressaoSetpoint);
+  Serial.printf("🔢 Contadores RTC | reiniciosMqtt=%u | bootsRuins=%u\n",
+                rtcEstado.reiniciosMqtt, rtcEstado.bootsRuins);
 
   carregarAgendaNVS();
   sensors.begin();
@@ -1335,6 +1370,12 @@ void loop() {
     if (pingOK) ultimoPingOK = millis();
     else Serial.printf("❌ Ping falhou | sem internet há %lu min (só diagnóstico)\n",
                        (millis() - ultimoPingOK) / 60000UL);
+  }
+
+  // 10 min ligado sem cair: não é mais boot loop
+  if (rtcEstado.bootsRuins != 0 && millis() > 600000UL) {
+    rtcEstado.bootsRuins = 0;
+    salvarRTC();
   }
 
   static unsigned long tsDiag = 0;
