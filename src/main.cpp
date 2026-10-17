@@ -10,6 +10,50 @@
 #include <math.h>
 #include <WebServer.h>
 #include <ElegantOTA.h>
+#include <esp_system.h>
+#include <esp_task_wdt.h>
+#include <driver/gpio.h>
+
+// ─── Controle da VAG — parâmetros de sintonia ─────────────────────────────────
+// PID_v1 em REVERSE (temperatura acima do setpoint → abre a VAG), saída em % (0–100),
+// proporcional na medição (P_ON_M): o Kp freia a variação da temperatura em vez de
+// reagir a degrau de setpoint; quem leva a temperatura até o setpoint é a integral.
+//
+// Sintonia em campo (mude UM parâmetro por vez e observe 1–2 h no Serial):
+//  - VAG ainda vai de um extremo ao outro, temperatura cruza o setpoint em ondas → aumente VAG_TI_S
+//    (720 → 1080 → 1440 s); se as ondas forem rápidas (< 10 min), reduza VAG_KP.
+//  - Temperatura fica parada fora da zona morta, VAG quase não se mexe → reduza VAG_TI_S (720 → 480 s).
+//  - Reação lenta a mudança de carga (porta aberta, sol) → aumente VAG_KP (30 → 40).
+//  - Válvula se mexendo à toa com temperatura estável → aumente VAG_ZONA_MORTA (0.2 → 0.3 °C)
+//    ou reduza VAG_ALFA_EMA (0.3 → 0.2, filtra mais porém atrasa).
+//  - Equilíbrio bom: temperatura dentro da zona morta, VAG parada num valor intermediário.
+const double        VAG_KP         = 30.0;                 // %/°C
+const double        VAG_TI_S       = 720.0;                // s — tempo integral
+const double        VAG_KI         = VAG_KP / VAG_TI_S;    // %/(°C·s) ≈ 0.042
+const double        VAG_KD         = 0.0;                  // D desligado: só amplificaria ruído do sensor
+const unsigned long CICLO_PID_MS   = 30000UL;              // período de leitura + Compute() (= SetSampleTime)
+const double        VAG_ALFA_EMA   = 0.3;                  // filtro da temperatura, por leitura (0–1; menor = mais filtrado)
+const double        VAG_ZONA_MORTA = 0.2;                  // °C — |setpoint − temp filtrada| <= isto: mantém a saída
+const double        VAG_TAXA_MAX   = 5.0;                  // %  — variação máxima da saída por ciclo
+const double        VAG_PASSO_MIN  = 1.0;                  // %  — só atualiza o atuador se mudar >= isto
+const double        PUB_VAG_DELTA  = 2.0;                  // %  — publica VAG se variar >= isto…
+const unsigned long PUB_VAG_MS     = 60000UL;              //      …ou a cada este intervalo
+
+// Pressão (inversor do ventilador): com o fancoil LIGADO a AO2 nunca fica abaixo deste valor,
+// para o inversor não rodar abaixo do mínimo seguro. Ajuste conforme o motor/inversor.
+const float         PRESSAO_MIN_LIGADO = 20.0f;            // %
+
+const unsigned long DEBOUNCE_MS    = 200UL;                // entradas MODO / STATUS
+
+// ─── Recuperação de rede (degraus, sem bloquear o loop) ──────────────────────
+const unsigned long MQTT_RETRY_MS        = 5000UL;      // a) MQTT caiu com Wi-Fi OK → tenta a cada 5 s
+const unsigned long WIFI_RECONNECT_MS    = 30000UL;     // b) Wi-Fi fora > 30 s → WiFi.reconnect()
+const unsigned long WIFI_RESET_PILHA_MS  = 180000UL;    // c) Wi-Fi fora > 3 min → reinicia a pilha Wi-Fi (repete a cada 3 min)
+const unsigned long MQTT_RESET_PILHA_MS  = 600000UL;    //    MQTT fora > 10 min com Wi-Fi OK → também reinicia a pilha (degrau c)
+const unsigned long MQTT_REINICIO_MS     = 1800000UL;   // d) MQTT fora > 30 min com Wi-Fi OK e c já tentado → reinício suave
+const unsigned long PING_MS              = 60000UL;     // ping só para LED/diagnóstico
+const unsigned long DIAG_MS              = 300000UL;    // RSSI e UPTIME a cada 5 min
+const uint32_t      WDT_TIMEOUT_S        = 60;          // watchdog do loop principal
 
 // ─── NTP ──────────────────────────────────────────────────────────────────────
 const char* ntpServer          = "pool.ntp.org";
@@ -38,10 +82,20 @@ String topic_setpoint;
 String topic_online;
 String topic_schedule;
 String topic_schedule_state;
+String topic_cmd_estado;      // TJS/<id>/CMD     — estado real do relé (retido)
+String topic_estado_real;     // TJS/<id>/ESTADO  — modo real AUTOMÁTICO/FORÇADO (retido)
+String topic_pressao;         // TJS/<id>/PRESSAO/SET
+String topic_versao;          // TJS/<id>/VERSAO
+String topic_pressao_estado;  // TJS/<id>/PRESSAO — valor aplicado na AO2 (retido)
+String topic_reset;           // TJS/<id>/RESET   — motivo do último reinício (retido)
+String topic_rssi;            // TJS/<id>/RSSI    — dBm (retido, a cada 5 min)
+String topic_uptime;          // TJS/<id>/UPTIME  — minutos (retido, a cada 5 min)
 
 // ─── Hardware ─────────────────────────────────────────────────────────────────
 #define ONE_WIRE_BUS    13
-#define PWM_PIN1        26
+// Saídas 0–10 V da KC868-A4: DAC do ESP32 (0–3,3 V) + amplificador ~3x. Só dacWrite, nunca PWM/LEDC.
+#define AO_VAG          25   // AO1 / DAC1 → atuador da VAG       (0–10 V = 0–100 %)
+#define AO_PRESSAO      26   // AO2 / DAC2 → inversor do ventilador (0–10 V = 0–100 %)
 #define LED_PIN         22
 #define RELE1_PIN        2
 #define RELE2_PIN       15
@@ -54,22 +108,25 @@ String topic_schedule_state;
 #define RELE_LIGADO    HIGH
 #define RELE_DESLIGADO LOW
 
-#define KP1  500
-#define KI1  5
-#define KD1  2
-
 #define EEPROM_SIZE       16
 #define ADDR_RELE1        0
 // endereços 1–3: livres (antiga janela horária local — agenda agora vem só do supervisório, no NVS)
 #define ADDR_ESTADO_CTRL  4   // estadoControladora (0=FORÇADO, 1=AUTOMÁTICO)
 #define ADDR_SETPOINT     8   // float (4 bytes) — setpoint persistido
+#define ADDR_PRESSAO     12   // float (4 bytes) — setpoint de pressão (%) persistido
 
 // ─── Versão do firmware ───────────────────────────────────────────────────────
-#define FIRMWARE_VERSION "1.1.0"
+#define FIRMWARE_VERSION "1.3.0"
 
 // ─── OTA ──────────────────────────────────────────────────────────────────────
+// Senha do AP OTA e do ElegantOTA (usuário "admin"). Mínimo 8 caracteres (WPA2).
+// Pode ser sobrescrita sem mexer no código: build_flags = -D OTA_SECRET=\"...\"
+#ifndef OTA_SECRET
+#define OTA_SECRET "@pilares1"
+#endif
+static_assert(sizeof(OTA_SECRET) - 1 >= 8, "OTA_SECRET precisa ter pelo menos 8 caracteres (WPA2)");
+
 WebServer otaServer(80);
-// OTA_AP_SENHA removida — AP aberto (sem senha)
 #define OTA_TIMEOUT_MS 300000UL
 
 // ─── Variáveis ────────────────────────────────────────────────────────────────
@@ -77,15 +134,31 @@ unsigned long buttonPressStartTime = 0;
 bool          btnOtaArmed          = false;
 const unsigned long buttonPressThreshold = 5000;
 
-double temperatura, vag, setpoint = 23.0;   // default seguro (PID REVERSE: 0 → fan 100%)
-PID pid1(&temperatura, &vag, &setpoint, KP1, KI1, KD1, REVERSE);
+double temperatura = NAN;   // temperatura FILTRADA (EMA) — entrada do PID; NAN até a 1ª leitura válida
+double vagPid      = 0;     // saída do PID (%) — memória do controlador
+double setpoint    = 23.0;  // default seguro
+PID pid1(&temperatura, &vagPid, &setpoint, VAG_KP, VAG_KI, VAG_KD, P_ON_M, REVERSE);
+
+double vagAtuador   = 0;     // % efetivamente aplicado na AO1
+bool   naZonaMorta  = false;
+bool   sensorEmFalha = false;
+double vagPublicada = -1;    // -1 = força publicação
+unsigned long tsPubVag = 0;
+
+float pressaoSetpoint = 0;   // % (0–100) — PRESSAO/SET, persistido na EEPROM
+float pressaoAplicada = -1;  // % efetivamente na AO2 (-1 = ainda não aplicada/publicada)
 
 int  estadoControladora = 1;
 bool releAtivado        = false;
 volatile bool portalAtivo = false;   // escrito no loop/callbacks, lido na taskLED
 
-int modoAnterior   = -1;
+int modoAnterior   = -1;   // último valor PUBLICADO (-1 = força publicação)
 int statusAnterior = -1;
+
+// Debounce das entradas digitais
+struct Debounce { int bruto; int estavel; unsigned long ts; };
+Debounce dbModo   = {-1, -1, 0};
+Debounce dbStatus = {-1, -1, 0};
 
 unsigned long ts1          = 0;
 unsigned long tsPing       = 0;
@@ -118,6 +191,89 @@ OneWire           oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 WiFiManager       wifiManager;
 
+// ─── Estado que sobrevive a reinício por software/watchdog (não a falta de energia) ───
+// Gravado a cada mudança de relé / VAG / pressão / modo, para que mesmo um reinício por
+// watchdog (que não passa por reinicioSuave) encontre o estado atual.
+struct EstadoRTC {
+  uint32_t magic;
+  uint8_t  rele;              // releAtivado
+  uint8_t  estado;            // estadoControladora
+  float    vagAtuador;
+  float    pressaoAplicada;
+  float    vagPid;
+  char     motivo[24];        // motivo próprio do reinício suave ("" = nenhum)
+  uint32_t checksum;
+};
+RTC_NOINIT_ATTR EstadoRTC rtcEstado;
+const uint32_t RTC_MAGIC = 0x48564143UL ^ (uint32_t)sizeof(EstadoRTC);   // "HVAC" + tamanho do layout
+
+static uint32_t checksumRTC() {   // FNV-1a sobre tudo menos o próprio checksum
+  const uint8_t* p = (const uint8_t*)&rtcEstado;
+  uint32_t h = 2166136261UL;
+  for (size_t i = 0; i < offsetof(EstadoRTC, checksum); i++) { h ^= p[i]; h *= 16777619UL; }
+  return h;
+}
+
+void salvarRTC() {
+  rtcEstado.magic           = RTC_MAGIC;
+  rtcEstado.rele            = releAtivado ? 1 : 0;
+  rtcEstado.estado          = (uint8_t)estadoControladora;
+  rtcEstado.vagAtuador      = (float)vagAtuador;
+  rtcEstado.pressaoAplicada = pressaoAplicada;
+  rtcEstado.vagPid          = (float)vagPid;
+  rtcEstado.motivo[sizeof(rtcEstado.motivo) - 1] = '\0';
+  rtcEstado.checksum        = checksumRTC();
+}
+
+String motivoReset;   // publicado em TJS/<id>/RESET — ex.: "SW / MQTT_30MIN", "TASK_WDT", "POWERON"
+
+static const char* nomeResetReason(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_EXT:       return "EXT";
+    case ESP_RST_SW:        return "SW";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "UNKNOWN";
+  }
+}
+
+// ─── Relés com gpio_hold ──────────────────────────────────────────────────────
+// Os relés ficam SEMPRE travados (gpio_hold_en) e só são liberados durante a escrita.
+// Assim um reinício por software OU watchdog encontra o pino preso no último nível.
+const gpio_num_t PINOS_RELE[] = {(gpio_num_t)RELE1_PIN, (gpio_num_t)RELE2_PIN,
+                                 (gpio_num_t)RELE3_PIN, (gpio_num_t)RELE4_PIN};
+
+static void travarReles(bool travar) {
+  for (gpio_num_t p : PINOS_RELE) { if (travar) gpio_hold_en(p); else gpio_hold_dis(p); }
+}
+
+void escreverReles(bool ligado) {
+  travarReles(false);
+  digitalWrite(RELE1_PIN, ligado ? RELE_LIGADO : RELE_DESLIGADO);
+  digitalWrite(RELE2_PIN, ligado ? RELE_LIGADO : RELE_DESLIGADO);   // exaustor acompanha o fancoil
+  travarReles(true);
+}
+
+// Reinício proposital sem mexer no fancoil: grava o estado na RTC, trava relés e AO1/AO2
+// no nível atual e reinicia. O setup() restaura tudo antes de Serial/Wi-Fi/NTP/MQTT.
+void reinicioSuave(const char* motivo) {
+  Serial.printf("♻️ REINÍCIO SUAVE | motivo: %s | relé=%s VAG=%.1f%% PRESSÃO=%.1f%%\n",
+                motivo, releAtivado ? "LIGADO" : "DESLIGADO", vagAtuador, pressaoAplicada);
+  strncpy(rtcEstado.motivo, motivo, sizeof(rtcEstado.motivo) - 1);
+  salvarRTC();
+  travarReles(true);
+  gpio_hold_en((gpio_num_t)AO_VAG);        // efeito nas saídas DAC: validar na bancada
+  gpio_hold_en((gpio_num_t)AO_PRESSAO);
+  Serial.flush();
+  ESP.restart();
+}
+
 // ─── Helpers de payload ───────────────────────────────────────────────────────
 bool payloadVerdadeiro(const String& p) {
   return (p == "true" || p == "1" || p.equalsIgnoreCase("LIGAR"));
@@ -136,6 +292,7 @@ void salvarRele(int estado) {
 void salvarEstadoCtrl() {
   EEPROM.write(ADDR_ESTADO_CTRL, (uint8_t)estadoControladora);
   EEPROM.commit();
+  salvarRTC();
 }
 
 void salvarSetpoint() {
@@ -152,8 +309,15 @@ void carregarEstadoCtrl() {
   EEPROM.get(ADDR_SETPOINT, sp);
   setpoint = (isnan(sp) || sp < 10.0 || sp > 35.0) ? 23.0 : sp;
 
-  Serial.printf("📂 Estado carregado | modo=%s | setpoint=%.1f°C\n",
-                estadoControladora == 1 ? "AUTOMÁTICO" : "FORÇADO", setpoint);
+  float pr;
+  EEPROM.get(ADDR_PRESSAO, pr);
+  pressaoSetpoint = (isnan(pr) || pr < 0.0f || pr > 100.0f) ? 0.0f : pr;   // EEPROM virgem → 0%
+  // log fica no setup(): esta função roda antes do Serial.begin()
+}
+
+void salvarPressao() {
+  EEPROM.put(ADDR_PRESSAO, pressaoSetpoint);
+  EEPROM.commit();
 }
 
 // ─── MQTT publish com log ─────────────────────────────────────────────────────
@@ -166,27 +330,46 @@ void mqttPublish(const String& topic, const String& payload, bool retained = fal
                 retained ? " 📌" : "");
 }
 
+// ─── Saídas analógicas 0–10 V (DAC) ──────────────────────────────────────────
+void saidaAnalogica(uint8_t pino, float pct) {
+  pct = constrain(pct, 0.0f, 100.0f);
+  dacWrite(pino, (uint8_t)lround(pct * 2.55f));
+}
+
+// AO2 = pressão salva (com piso PRESSAO_MIN_LIGADO) só com o relé LIGADO; senão 0 V.
+// Publica o valor aplicado em TJS/<id>/PRESSAO (retido) quando muda.
+void aplicarPressao() {
+  float alvo = releAtivado ? max(pressaoSetpoint, PRESSAO_MIN_LIGADO) : 0.0f;
+  saidaAnalogica(AO_PRESSAO, alvo);
+  if (fabsf(alvo - pressaoAplicada) > 0.01f) {
+    pressaoAplicada = alvo;
+    salvarRTC();
+    Serial.printf("💨 AO2 PRESSÃO → %.1f%%\n", alvo);
+    mqttPublish(topic_pressao_estado, String(alvo, 1), true);
+  }
+}
+
 
 // ─── MODO OTA ─────────────────────────────────────────────────────────────────
 void entrarModoOTA() {
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   Serial.println("🔄 ENTRANDO EM MODO OTA");
-  digitalWrite(RELE1_PIN, RELE_DESLIGADO);
-  digitalWrite(RELE2_PIN, RELE_DESLIGADO);   // exaustor acompanha o fancoil
+  escreverReles(false);                      // fancoil + exaustor desligados durante o OTA
+  saidaAnalogica(AO_VAG, 0);                 // relé desligado → VAG e inversor em 0 V
+  saidaAnalogica(AO_PRESSAO, 0);
   client.publish(topic_online.c_str(), "0", true, 1); // saída deliberada (OTA) também marca offline
   client.disconnect();
   WiFi.mode(WIFI_AP_STA);  // mantém STA conectado + sobe AP
   delay(300);
 
   String apNome  = "HVAC-" + mqtt_id + "-OTA";
-  String apSenha = "hvac" + mqtt_id + "ota";   // >= 8 chars — fecha flash anônimo por rádio
-  WiFi.softAP(apNome.c_str(), apSenha.c_str());
+  WiFi.softAP(apNome.c_str(), OTA_SECRET);
   delay(500);
 
   IPAddress ip = WiFi.softAPIP();
   Serial.println("📶 AP OTA ATIVO");
   Serial.println("   SSID  : " + apNome);
-  Serial.println("   Senha : " + apSenha);
+  Serial.println("   Senha : OTA_SECRET (definida no firmware)");
   Serial.print(  "   Acesse: http://"); Serial.print(ip); Serial.println("/update");
   Serial.println("   Timeout: 5 minutos");
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -226,7 +409,7 @@ void entrarModoOTA() {
       "</body></html>";
     otaServer.send(200, "text/html", html);
     delay(500);
-    ESP.restart();
+    reinicioSuave("OTA_RESTART");
   });
 
   // ── Teste de conexão MQTT ────────────────────────────────────────────────────
@@ -237,8 +420,9 @@ void entrarModoOTA() {
 
     if (wifiOK) {
       WiFiClient testNet;
-      testNet.setTimeout(3000);
+      testNet.setTimeout(3);           // core 2.0.x: SEGUNDOS (o antigo 3000 eram 50 min)
       MQTTClient testClient(256);
+      testClient.setTimeout(2000);
       testClient.begin(mqtt_server, testNet);
       String testId = mqtt_id + "_test";
       mqttOK = testClient.connect(testId.c_str(), mqtt_username, mqtt_password);
@@ -286,10 +470,10 @@ void entrarModoOTA() {
       "<h2>✅ Saindo do modo OTA...</h2><small>A controladora vai reiniciar.</small>"
       "</body></html>");
     delay(300);
-    ESP.restart();
+    reinicioSuave("OTA_EXIT");
   });
 
-  ElegantOTA.setAuth("admin", apSenha.c_str());
+  ElegantOTA.setAuth("admin", OTA_SECRET);
   ElegantOTA.begin(&otaServer);
   otaServer.begin();
 
@@ -297,6 +481,7 @@ void entrarModoOTA() {
   unsigned long tPiscar = millis();
 
   while (millis() - tOTA < OTA_TIMEOUT_MS) {
+    esp_task_wdt_reset();
     otaServer.handleClient();
     ElegantOTA.loop();
     if (millis() - tPiscar >= 50) {
@@ -306,39 +491,59 @@ void entrarModoOTA() {
   }
 
   Serial.println("⏱️ Timeout OTA. Reiniciando...");
-  delay(500);
-  ESP.restart();
+  reinicioSuave("OTA_TIMEOUT");
+}
+
+// ─── VAG: atuador ─────────────────────────────────────────────────────────────
+// O controle trabalha em %; a conversão para 0–255 do DAC acontece só em saidaAnalogica().
+void escreverVAG(double pct) {
+  vagAtuador = constrain(pct, 0.0, 100.0);
+  saidaAnalogica(AO_VAG, vagAtuador);
+  salvarRTC();
+}
+
+void publicarVAG(bool forcar) {
+  if (!forcar && vagPublicada >= 0 && fabs(vagAtuador - vagPublicada) < PUB_VAG_DELTA &&
+      millis() - tsPubVag < PUB_VAG_MS) return;
+  mqttPublish(topic_vag, releAtivado ? String(vagAtuador, 1) : String("0"), true);
+  vagPublicada = vagAtuador;
+  tsPubVag     = millis();
 }
 
 // ─── Liga relé ────────────────────────────────────────────────────────────────
 void ligarRele(const char* motivo) {
   Serial.printf("🔌 ligarRele() | motivo: %s | releAtivado: %s\n",
                 motivo, releAtivado ? "já ligado" : "false");
-  if (releAtivado) return;
-  digitalWrite(RELE1_PIN, RELE_LIGADO);
-  digitalWrite(RELE2_PIN, RELE_LIGADO);   // exaustor acompanha o fancoil
+  if (releAtivado) return;   // idempotente: nada a fazer, nada a publicar
+  escreverReles(true);                    // fancoil + exaustor
   salvarRele(RELE_LIGADO);
   releAtivado = true;
-  pid1.SetMode(AUTOMATIC);
+  salvarRTC();
+  naZonaMorta = false;
+  // Parte de vagPid (0 após desligar). Sem temperatura válida ainda (boot/falha),
+  // o vagPID() passa para AUTOMATIC na primeira leitura boa.
+  if (!sensorEmFalha && !isnan(temperatura)) pid1.SetMode(AUTOMATIC);
   Serial.println("✅ RELÉ LIGADO (fancoil + exaustor)");
-  mqttPublish(topic_cmd, "true", true);
+  aplicarPressao();                          // inversor na pressão salva
+  mqttPublish(topic_cmd_estado, "true", true);
 }
 
 // ─── Desliga relé ─────────────────────────────────────────────────────────────
 void desligarRele(const char* motivo) {
   Serial.printf("🔌 desligarRele() | motivo: %s | releAtivado: %s\n",
                 motivo, releAtivado ? "true" : "já desligado");
-  if (!releAtivado) return;
+  if (!releAtivado) return;   // idempotente: nada a fazer, nada a publicar
   pid1.SetMode(MANUAL);
-  vag = 0;
-  analogWrite(PWM_PIN1, 0);
-  digitalWrite(RELE1_PIN, RELE_DESLIGADO);
-  digitalWrite(RELE2_PIN, RELE_DESLIGADO);   // exaustor acompanha o fancoil
+  vagPid = 0;
+  escreverVAG(0);
+  escreverReles(false);                      // fancoil + exaustor
   salvarRele(RELE_DESLIGADO);
   releAtivado = false;
+  salvarRTC();
   Serial.println("⛔ RELÉ DESLIGADO (fancoil + exaustor)");
-  mqttPublish(topic_vag, "0", true);
-  mqttPublish(topic_cmd, "false", true);
+  aplicarPressao();                          // inversor em 0 V
+  publicarVAG(true);
+  mqttPublish(topic_cmd_estado, "false", true);
 }
 
 // ─── Agenda: parser ───────────────────────────────────────────────────────────
@@ -471,24 +676,33 @@ static void carregarAgendaNVS() {
   agendaCatchupPendente = (n > 0);
 }
 
-// ─── Agenda: execução ─────────────────────────────────────────────────────────
-// Aplica direto nas funções internas (funciona sem broker) e publica o novo estado retido
-// para o supervisório acompanhar e para o retained não reverter o modo no próximo boot.
-static void definirEstado(bool automatico) {
+// ─── Estado da controladora (AUTOMÁTICO / FORÇADO) ───────────────────────────
+// Publica o estado real em TJS/<id>/ESTADO só quando muda (idempotente).
+// porAgenda=true: regrava também o retido de ESTADO/SET (1 vez por disparo), para o
+// retido antigo do broker não reverter o modo no próximo boot.
+static void definirEstado(bool automatico, bool porAgenda) {
   int novo = automatico ? 1 : 0;
-  if (estadoControladora != novo) { estadoControladora = novo; salvarEstadoCtrl(); }
-  mqttPublish(topic_estado, automatico ? "true" : "false", true);
+  if (estadoControladora != novo) {
+    estadoControladora = novo;
+    salvarEstadoCtrl();
+    Serial.printf("   🔄 Controladora → %s\n", automatico ? "AUTOMÁTICO" : "FORÇADO");
+    mqttPublish(topic_estado_real, automatico ? "true" : "false", true);
+  }
+  if (porAgenda) mqttPublish(topic_estado, automatico ? "true" : "false", true);
 }
 
+// ─── Agenda: execução ─────────────────────────────────────────────────────────
+// ESTADO e SETPOINT valem sempre. CMD só vale em AUTOMÁTICO (não altera o ESTADO);
+// em FORÇADO quem manda no relé é o CMD/SET manual.
 static void executarSlot(const SlotAgenda& s) {
   static const char* nomes[] = {"ESTADO", "CMD", "SETPOINT"};
   Serial.printf("⏰ AGENDA %02d:%02d → %s = %.1f\n", s.hora, s.minuto, nomes[s.acao], s.valor);
   switch (s.acao) {
     case ACAO_ESTADO:
-      definirEstado(s.valor > 0);
+      definirEstado(s.valor > 0, true);
       break;
     case ACAO_CMD:
-      definirEstado(false);   // CMD só vale em modo FORÇADO
+      if (estadoControladora == 0) { Serial.println("   ℹ️ CMD da agenda ignorado: FORÇADO"); break; }
       if (s.valor > 0) ligarRele("agenda");
       else             desligarRele("agenda");
       break;
@@ -499,8 +713,10 @@ static void executarSlot(const SlotAgenda& s) {
   }
 }
 
-// Aplica o último evento já passado de cada ação (até 7 dias atrás), do mais antigo ao mais novo.
+// Aplica o último evento já passado de cada ação (até 7 dias atrás).
 // Cobre queda de energia (boot às 07:05 com slot das 07:00) e agenda recém-recebida.
+// Ordem fixa ESTADO → SETPOINT → CMD: o CMD é avaliado já com o ESTADO esperado para agora
+// (mesma regra do disparo normal: ignorado se o resultado for FORÇADO).
 static void recuperarEstadoAgenda(const struct tm& t) {
   int  agora = t.tm_hour * 60 + t.tm_min;
   long ago[3] = {-1, -1, -1};   // minutos desde o último evento de cada ação
@@ -517,15 +733,9 @@ static void recuperarEstadoAgenda(const struct tm& t) {
     }
   }
 
-  bool feito[3] = {false, false, false};
-  for (int k = 0; k < 3; k++) {
-    int melhor = -1;
-    for (int a = 0; a < 3; a++)
-      if (!feito[a] && idx[a] >= 0 && (melhor < 0 || ago[a] > ago[melhor])) melhor = a;
-    if (melhor < 0) break;
-    feito[melhor] = true;
-    executarSlot(slots[idx[melhor]]);
-  }
+  static const uint8_t ordem[3] = {ACAO_ESTADO, ACAO_SETPOINT, ACAO_CMD};
+  for (uint8_t a : ordem)
+    if (idx[a] >= 0) executarSlot(slots[idx[a]]);
 }
 
 // Chamar a cada iteração do loop(): checa 1x por segundo
@@ -561,21 +771,39 @@ void verificarAgenda() {
   }
 }
 
-// ─── Entradas digitais → publica se mudou ────────────────────────────────────
+// ─── Entradas digitais → publica (retido) se mudou ───────────────────────────
+// Devolve o valor estável (1 = ativo/LOW) ou -1 enquanto ainda não estabilizou desde o boot
+static int lerComDebounce(uint8_t pino, Debounce& d) {
+  int r = (digitalRead(pino) == LOW) ? 1 : 0;
+  if (r != d.bruto) { d.bruto = r; d.ts = millis(); }
+  else if (millis() - d.ts >= DEBOUNCE_MS) d.estavel = r;
+  return d.estavel;
+}
+
 void lerEPublicarEntradas() {
-  int modoAtual = (digitalRead(BTN_AUTO_MANUAL) == LOW) ? 1 : 0;
-  if (modoAtual != modoAnterior) {
+  int modoAtual = lerComDebounce(BTN_AUTO_MANUAL, dbModo);
+  if (modoAtual >= 0 && modoAtual != modoAnterior) {
     modoAnterior = modoAtual;
     Serial.printf("🔁 MODO (GPIO%d) → %s\n", BTN_AUTO_MANUAL, modoAtual ? "AUTO" : "MANUAL");
-    mqttPublish(topic_modo, String(modoAtual));
+    mqttPublish(topic_modo, String(modoAtual), true);
   }
 
-  int statusAtual = (digitalRead(BTN_STATUS) == LOW) ? 1 : 0;
-  if (statusAtual != statusAnterior) {
+  int statusAtual = lerComDebounce(BTN_STATUS, dbStatus);
+  if (statusAtual >= 0 && statusAtual != statusAnterior) {
     statusAnterior = statusAtual;
     Serial.printf("🔁 STATUS (GPIO%d) → %s\n", BTN_STATUS, statusAtual ? "LIGADO" : "DESLIGADO");
-    mqttPublish(topic_status, String(statusAtual));
+    mqttPublish(topic_status, String(statusAtual), true);
   }
+}
+
+// ─── Portal Wi-Fi (WiFiManager não bloqueante) ───────────────────────────────
+// Abre o AP de configuração sem parar o controle; wifiManager.process() roda no loop.
+// As credenciais atuais só são substituídas se o usuário salvar novas no portal.
+void abrirPortalWifi() {
+  if (wifiManager.getConfigPortalActive()) return;
+  String apNome = "AutoConnect_" + mqtt_id;
+  Serial.println("📶 Abrindo portal Wi-Fi (não bloqueante): " + apNome);
+  wifiManager.startConfigPortal(apNome.c_str());
 }
 
 // ─── ✅ Botão WiFi — leitura não bloqueante ───────────────────────────────────
@@ -594,13 +822,11 @@ void verificarBotaoWifi() {
       if (held >= 3000 && held < 3100) Serial.println("   3s...");
       if (held >= 4000 && held < 4100) Serial.println("   4s...");
 
-      // ≥ 5s → reset WiFi (dispara enquanto pressionado)
-      if (held >= buttonPressThreshold) {
+      // ≥ 5s → abre o portal Wi-Fi (uma vez por pressão; o fancoil continua rodando)
+      if (held >= buttonPressThreshold && btnOtaArmed) {
         btnOtaArmed = false;
-        Serial.println("🔄 5s atingido → RESET WI-FI");
-        wifiManager.resetSettings();
-        delay(500);
-        ESP.restart();
+        Serial.println("📶 5s atingido → PORTAL WI-FI");
+        abrirPortalWifi();
       }
     }
   } else {
@@ -653,36 +879,135 @@ void taskLED(void* param) {
   }
 }
 
-// ─── ✅ Ping com timeout reduzido para não bloquear o botão ──────────────────
+// ─── Ping (só LED / diagnóstico — não reinicia mais nada) ────────────────────
+// IPs fixos (sem DNS, que podia bloquear até 15 s) e timeout de connect em ms explícito:
+// no core 2.0.x WiFiClient::setTimeout() é em SEGUNDOS — o antigo setTimeout(800) virava 800 s.
 bool pingInternet() {
+  if (WiFi.status() != WL_CONNECTED) return false;
   WiFiClient pingClient;
-  pingClient.setTimeout(800);    // 0.8s por host (total máx ~2.4s) — evita travar o loop()
-  if (pingClient.connect("google.com", 80))     { pingClient.stop(); Serial.println("✅ Ping OK → google.com:80");  return true; }
-  if (pingClient.connect("1.1.1.1", 80))        { pingClient.stop(); Serial.println("✅ Ping OK → 1.1.1.1:80");     return true; }
-  if (pingClient.connect("208.67.222.222", 80)) { pingClient.stop(); Serial.println("✅ Ping OK → OpenDNS:80");     return true; }
+  if (pingClient.connect(IPAddress(1, 1, 1, 1), 80, 1500))        { pingClient.stop(); return true; }
+  if (pingClient.connect(IPAddress(208, 67, 222, 222), 80, 1500)) { pingClient.stop(); return true; }
   return false;
+}
+
+// ─── Diagnóstico (retidos) ────────────────────────────────────────────────────
+void publicarDiagnostico() {
+  mqttPublish(topic_rssi,   String(WiFi.RSSI()), true);
+  mqttPublish(topic_uptime, String((uint32_t)(esp_timer_get_time() / 60000000ULL)), true);
 }
 
 // ─── Reconexão MQTT ───────────────────────────────────────────────────────────
 void reconnectMQTT() {
   if (WiFi.status() != WL_CONNECTED) return;
   Serial.println("🔄 Reconectando MQTT...");
+  client.disconnect();   // descarta sessão/socket meio-aberto antes de tentar de novo
+  net.stop();
   if (client.connect(mqtt_id.c_str(), mqtt_username, mqtt_password)) {
     Serial.println("✅ MQTT conectado!");
     client.subscribe(topic_cmd,      1); Serial.println("📋 Subscrito: " + topic_cmd);
     client.subscribe(topic_estado,   1); Serial.println("📋 Subscrito: " + topic_estado);
     client.subscribe(topic_setpoint, 1); Serial.println("📋 Subscrito: " + topic_setpoint);
     client.subscribe(topic_schedule, 1); Serial.println("📋 Subscrito: " + topic_schedule);
+    client.subscribe(topic_pressao,  1); Serial.println("📋 Subscrito: " + topic_pressao);
     modoAnterior   = -1;
     statusAnterior = -1;
     lerEPublicarEntradas();
-    mqttPublish(topic_cmd,    releAtivado ? "true" : "false", true);
-    // NÃO republicar topic_estado: ESTADO/SET é comando de entrada — só o SCADA escreve.
-    // A controladora apenas consome o retido do broker; o valor local é persistido na EEPROM.
+    // Estado REAL em tópicos próprios. CMD/SET e ESTADO/SET são comandos de entrada —
+    // a controladora não os republica (exceto ESTADO/SET no disparo da agenda).
+    mqttPublish(topic_cmd_estado,  releAtivado ? "true" : "false", true);
+    mqttPublish(topic_estado_real, estadoControladora == 1 ? "true" : "false", true);
+    mqttPublish(topic_versao,      FIRMWARE_VERSION, true);
+    if (pressaoAplicada >= 0) mqttPublish(topic_pressao_estado, String(pressaoAplicada, 1), true);
+    mqttPublish(topic_reset, motivoReset, true);
+    publicarDiagnostico();
     client.publish(topic_online.c_str(), "1", true, 1); // confirma presença (retido, QoS 1)
     publicarEstadoAgenda();
+    vagPublicada = -1;   // VAG republicada no próximo ciclo do PID
   } else {
     Serial.printf("⚠️ MQTT falhou | erro: %d\n", client.lastError());
+  }
+}
+
+// ─── Recuperação de rede em degraus (máquina de estados com millis) ──────────
+void configurarWifi() {
+  WiFi.setSleep(false);          // modem-sleep atrasa/perde pacotes e derruba o keepalive MQTT
+  WiFi.setAutoReconnect(true);
+}
+
+unsigned long tsWifiCaiu     = 0;      // 0 = Wi-Fi conectado
+unsigned long tsDegrauWifi   = 0;      // último degrau b/c executado
+uint8_t       degrauWifi     = 0;      // 0 = nenhum | 1 = reconnect (b) | 2 = pilha reiniciada (c)
+unsigned long tsMqttOK       = 0;      // última vez que o MQTT estava conectado
+unsigned long tsResetPilha   = 0;      // último degrau c
+bool          pilhaResetadaSemMqtt = false;   // houve degrau c desde a última conexão MQTT
+
+// c) Wi-Fi off/on e begin() com as credenciais salvas (NVS). Bloqueia ~0,3 s.
+static void reiniciarPilhaWifi(const char* porque) {
+  Serial.printf("🛠️ [c] Reiniciando a pilha Wi-Fi (%s)\n", porque);
+  client.disconnect();
+  net.stop();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(200);
+  WiFi.mode(WIFI_STA);
+  configurarWifi();
+  WiFi.begin();
+  tsResetPilha         = millis();
+  pilhaResetadaSemMqtt = true;
+}
+
+void verificarRede() {
+  unsigned long agora = millis();
+  if (portalAtivo) return;   // portal de configuração no ar: ele cuida do Wi-Fi
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (tsWifiCaiu) {
+      Serial.printf("✅ Wi-Fi voltou após %lus | IP %s | RSSI %d dBm\n",
+                    (agora - tsWifiCaiu) / 1000UL, WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      tsWifiCaiu = 0;
+      degrauWifi = 0;
+    }
+    if (client.connected()) {
+      tsMqttOK = agora;
+      pilhaResetadaSemMqtt = false;
+      return;
+    }
+
+    // a) MQTT fora com Wi-Fi OK → tenta a cada 5 s
+    static unsigned long tReconnect = 0;
+    if (agora - tReconnect >= MQTT_RETRY_MS) {
+      tReconnect = agora;
+      Serial.printf("🔄 [a] MQTT fora há %lus com Wi-Fi OK\n", (agora - tsMqttOK) / 1000UL);
+      reconnectMQTT();
+      if (client.connected()) return;
+    }
+
+    unsigned long semMqtt = agora - tsMqttOK;
+    if (semMqtt > MQTT_RESET_PILHA_MS && !pilhaResetadaSemMqtt) {
+      reiniciarPilhaWifi("MQTT fora > 10 min com Wi-Fi OK");
+    } else if (semMqtt > MQTT_REINICIO_MS && pilhaResetadaSemMqtt &&
+               agora - tsResetPilha > WIFI_RESET_PILHA_MS) {
+      Serial.println("❌ [d] MQTT fora > 30 min com Wi-Fi OK e degraus a–c esgotados");
+      reinicioSuave("MQTT_30MIN");
+    }
+    return;
+  }
+
+  // Wi-Fi desconectado
+  if (tsWifiCaiu == 0) {
+    tsWifiCaiu = tsDegrauWifi = agora;
+    degrauWifi = 0;
+    Serial.printf("⚠️ Wi-Fi caiu (status %d)\n", WiFi.status());
+  }
+  unsigned long fora = agora - tsWifiCaiu;
+  if (degrauWifi == 0 && fora > WIFI_RECONNECT_MS) {
+    degrauWifi = 1;
+    Serial.printf("🔄 [b] Wi-Fi fora há %lus → WiFi.reconnect()\n", fora / 1000UL);
+    WiFi.reconnect();
+  } else if (fora > WIFI_RESET_PILHA_MS && agora - tsDegrauWifi > WIFI_RESET_PILHA_MS) {
+    degrauWifi   = 2;
+    tsDegrauWifi = agora;
+    reiniciarPilhaWifi("Wi-Fi fora > 3 min");   // repete a cada 3 min enquanto não voltar
   }
 }
 
@@ -701,14 +1026,28 @@ void messageReceived(String &topic, String &payload) {
     }
   }
   else if (topic == topic_estado) {
-    if (payloadVerdadeiro(payload)) {
-      if (estadoControladora != 1) { estadoControladora = 1; salvarEstadoCtrl(); }
-      Serial.println("   🔄 Controladora → AUTOMÁTICO (CMD manual ignorado)");
-    } else if (payloadFalso(payload)) {
-      if (estadoControladora != 0) { estadoControladora = 0; salvarEstadoCtrl(); }
-      Serial.println("   🔄 Controladora → FORÇADO (aceita TJS/CMD/SET)");
+    if (payloadVerdadeiro(payload) || payloadFalso(payload)) {
+      bool automatico = payloadVerdadeiro(payload);
+      if ((estadoControladora == 1) == automatico)
+        Serial.println("   ℹ️ ESTADO igual ao atual — nada a fazer");
+      else
+        definirEstado(automatico, false);
     } else {
       Serial.printf("   ⚠️ ESTADO payload desconhecido: \"%s\"\n", payload.c_str());
+    }
+  }
+  else if (topic == topic_pressao) {
+    char* fim;
+    float pr = strtof(payload.c_str(), &fim);
+    if (payload.length() == 0 || *fim != '\0' || isnan(pr) || pr < 0.0f || pr > 100.0f) {
+      Serial.printf("   ⚠️ PRESSAO fora da faixa (0–100%%) ou inválida: \"%s\" — ignorado\n", payload.c_str());
+    } else if (fabsf(pr - pressaoSetpoint) <= 0.01f) {
+      Serial.println("   ℹ️ PRESSAO igual à atual — nada a fazer");
+    } else {
+      pressaoSetpoint = pr;
+      salvarPressao();
+      Serial.printf("   💨 Pressão salva → %.1f%%\n", pressaoSetpoint);
+      aplicarPressao();                      // só chega na AO2 com o relé LIGADO
     }
   }
   else if (topic == topic_schedule) {
@@ -727,86 +1066,165 @@ void messageReceived(String &topic, String &payload) {
   else if (topic == topic_cmd) {
     Serial.printf("   🔘 CMD | estadoControladora=%d (%s)\n",
                   estadoControladora, estadoControladora == 1 ? "AUTOMÁTICO" : "FORÇADO");
-    if (estadoControladora == 0) {
-      if (payloadVerdadeiro(payload))      ligarRele("CMD/SET = LIGAR");
-      else if (payloadFalso(payload))      desligarRele("CMD/SET = DESLIGAR");
-      else Serial.printf("   ⚠️ CMD payload desconhecido: \"%s\"\n", payload.c_str());
+    if (!payloadVerdadeiro(payload) && !payloadFalso(payload)) {
+      Serial.printf("   ⚠️ CMD payload desconhecido: \"%s\"\n", payload.c_str());
+    } else if (estadoControladora == 1) {
+      Serial.println("   ℹ️ CMD manual ignorado: AUTOMÁTICO (relé segue a agenda)");
+    } else if (payloadVerdadeiro(payload) == releAtivado) {
+      Serial.println("   ℹ️ CMD igual ao estado atual — nada a fazer");
+    } else if (payloadVerdadeiro(payload)) {
+      ligarRele("CMD/SET = LIGAR");
     } else {
-      String estadoReal = releAtivado ? "true" : "false";
-      if (payload != estadoReal) {
-        Serial.printf("   🔄 Corrigindo ScadaBR: CMD real = \"%s\"\n", estadoReal.c_str());
-        mqttPublish(topic_cmd, estadoReal, true);
-      } else {
-        Serial.println("   ℹ️ CMD ignorado → ScadaBR já sincronizado");
-      }
+      desligarRele("CMD/SET = DESLIGAR");
     }
   }
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
 
-// ─── PID + VAG ────────────────────────────────────────────────────────────────
-float convertToPercentage(int v) { return (v / 255.0) * 100.0; }
-
+// ─── PID + VAG (chamado a cada CICLO_PID_MS) ──────────────────────────────────
 void vagPID() {
-  sensors.requestTemperatures();
+  sensors.requestTemperatures();               // bloqueante, ~750 ms em 12 bits
   float leitura = sensors.getTempCByIndex(0);
 
   // DS18B20 retorna -127 em falha de comunicação e 85.0 no power-on reset
   if (leitura <= -100.0 || leitura >= 84.0) {
-    Serial.printf("⚠️ Sensor DS18B20 FALHOU (leitura: %.1f°C) — PID suspenso\n", leitura);
-    analogWrite(PWM_PIN1, 0);
-    mqttPublish(topic_temperatura, "ERRO", false);
+    Serial.printf("⚠️ Sensor DS18B20 FALHOU (leitura: %.1f°C) — VAG fechada, PID em MANUAL\n", leitura);
+    if (!sensorEmFalha) {
+      sensorEmFalha = true;
+      pid1.SetMode(MANUAL);       // vagPid guarda o último valor para retomar sem salto
+      escreverVAG(0);
+      mqttPublish(topic_vag, "0", true);
+      vagPublicada = 0;
+      tsPubVag     = millis();
+    }
+    mqttPublish(topic_temperatura, "ERRO", true);
+    return;
+  }
+  if (sensorEmFalha) {
+    sensorEmFalha = false;
+    temperatura   = NAN;          // filtro reinicia com a leitura atual
+    Serial.println("✅ Sensor DS18B20 recuperado");
+  }
+
+  // Filtro EMA antes do PID
+  temperatura = isnan(temperatura) ? leitura : temperatura + VAG_ALFA_EMA * (leitura - temperatura);
+  mqttPublish(topic_temperatura, String(temperatura, 1), true);
+
+  if (!releAtivado) {
+    Serial.printf("   🌡️  Temp: %.2f°C (bruta %.2f) | Relé desligado\n", temperatura, leitura);
+    publicarVAG(false);
     return;
   }
 
-  temperatura = leitura;
+  // Volta da falha de sensor: Initialize() parte de vagPid (último valor) e da temperatura atual
+  if (pid1.GetMode() == MANUAL) pid1.SetMode(AUTOMATIC);
 
-  if (releAtivado) {
-    pid1.Compute();
-    int   pwm = (int)vag;
-    float pct = convertToPercentage(pwm);
-    analogWrite(PWM_PIN1, pwm);
-    Serial.printf("   🌡️  Temp: %.1f°C | Setpoint: %.1f°C | PWM: %d (%.1f%%)\n",
-                  temperatura, setpoint, pwm, pct);
-    mqttPublish(topic_temperatura, String(temperatura, 1), true);
-    mqttPublish(topic_vag,         String(pct, 1), true);
+  double erro = setpoint - temperatura;
+  if (fabs(erro) <= VAG_ZONA_MORTA) {
+    naZonaMorta = true;           // Compute() não roda: saída mantida e sem integrar
   } else {
-    analogWrite(PWM_PIN1, 0);
-    Serial.printf("   🌡️  Temp: %.1f°C | Relé desligado\n", temperatura);
-    mqttPublish(topic_temperatura, String(temperatura, 1), true);
-    mqttPublish(topic_vag,         "0", true);
+    if (naZonaMorta) {            // saída da zona morta sem salto: PID retoma do valor aplicado
+      naZonaMorta = false;
+      vagPid = vagAtuador;
+      pid1.SetMode(MANUAL);
+      pid1.SetMode(AUTOMATIC);
+    }
+    pid1.Compute();
+
+    // Limite de taxa + passo mínimo no atuador
+    double alvo    = vagAtuador + constrain(vagPid - vagAtuador, -VAG_TAXA_MAX, VAG_TAXA_MAX);
+    bool   extremo = (alvo <= 0.0 || alvo >= 100.0) && alvo != vagAtuador;   // fechar/abrir totalmente
+    if (fabs(alvo - vagAtuador) >= VAG_PASSO_MIN || extremo) escreverVAG(alvo);
   }
+
+  Serial.printf("   🌡️  Temp: %.2f°C (bruta %.2f) | SP: %.1f°C | PID: %.1f%% | VAG: %.1f%%%s\n",
+                temperatura, leitura, setpoint, vagPid, vagAtuador, naZonaMorta ? " [zona morta]" : "");
+  publicarVAG(false);
+}
+
+// ─── Restauro das saídas no boot ──────────────────────────────────────────────
+// Roda no INÍCIO do setup(), antes de Serial/Wi-Fi/NTP/MQTT. Não passa por ligarRele/
+// desligarRele e não publica nada: o relé não pisca e o supervisório não vê "false".
+//  - Reset "quente" (software, watchdog, panic) com RTC válida → estado exato de antes.
+//  - Senão (falta de energia, brownout, RTC inválida) → EEPROM: relé e pressão salvos, VAG de 0.
+// Devolve true se veio da RTC.
+static bool restaurarSaidas(esp_reset_reason_t rr) {
+  bool quente = (rr == ESP_RST_SW || rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT ||
+                 rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT);
+  bool rtcOk = quente && rtcEstado.magic == RTC_MAGIC && rtcEstado.checksum == checksumRTC() &&
+               rtcEstado.rele <= 1 && rtcEstado.estado <= 1 &&
+               rtcEstado.vagAtuador >= 0.0f && rtcEstado.vagAtuador <= 100.0f &&
+               rtcEstado.vagPid >= 0.0f && rtcEstado.vagPid <= 100.0f &&
+               rtcEstado.pressaoAplicada >= -1.0f && rtcEstado.pressaoAplicada <= 100.0f;   // NaN reprova
+
+  motivoReset = nomeResetReason(rr);
+  if (rtcOk) {
+    releAtivado        = rtcEstado.rele;
+    estadoControladora = rtcEstado.estado;
+    vagAtuador         = rtcEstado.vagAtuador;
+    vagPid             = rtcEstado.vagPid;   // PID retoma daqui (AUTOMATIC na 1ª leitura de temperatura)
+    pressaoAplicada    = rtcEstado.pressaoAplicada;
+    if (rtcEstado.motivo[0]) motivoReset += String(" / ") + rtcEstado.motivo;
+  } else {
+    releAtivado     = (EEPROM.read(ADDR_RELE1) == RELE_LIGADO);
+    vagAtuador      = 0;
+    vagPid          = 0;
+    pressaoAplicada = releAtivado ? max(pressaoSetpoint, PRESSAO_MIN_LIGADO) : 0.0f;
+  }
+
+  // Nível escrito ANTES de habilitar a saída: o pino já nasce no estado certo.
+  // Se o hold do reinício anterior ainda estiver ativo, isto só vale quando ele for liberado.
+  uint8_t nivel = releAtivado ? RELE_LIGADO : RELE_DESLIGADO;
+  digitalWrite(RELE1_PIN, nivel);
+  digitalWrite(RELE2_PIN, nivel);
+  digitalWrite(RELE3_PIN, RELE_DESLIGADO);
+  digitalWrite(RELE4_PIN, RELE_DESLIGADO);
+  for (gpio_num_t p : PINOS_RELE) pinMode(p, OUTPUT);
+  saidaAnalogica(AO_VAG, vagAtuador);
+  saidaAnalogica(AO_PRESSAO, max(pressaoAplicada, 0.0f));
+
+  // Só agora solta o hold: o pad passa a seguir a configuração acima (mesmo nível)
+  travarReles(false);
+  gpio_hold_dis((gpio_num_t)AO_VAG);
+  gpio_hold_dis((gpio_num_t)AO_PRESSAO);
+  travarReles(true);                      // relés voltam a ficar travados entre escritas
+
+  rtcEstado.motivo[0] = '\0';             // motivo próprio vale só para este boot
+  salvarRTC();
+  return rtcOk;
 }
 
 // ─── SETUP ────────────────────────────────────────────────────────────────────
 void setup() {
-  Serial.begin(115200);
+  // 1) Fancoil primeiro: relés + AO1/AO2 no estado certo antes de qualquer coisa lenta
+  esp_reset_reason_t rr = esp_reset_reason();
   EEPROM.begin(EEPROM_SIZE);
-  carregarAgendaNVS();
   carregarEstadoCtrl();
+  bool restauroRTC = restaurarSaidas(rr);
+
+  Serial.begin(115200);
+  Serial.printf("\n♻️ Reset: %s | restauro: %s | relé=%s VAG=%.1f%% PRESSÃO=%.1f%%\n",
+                motivoReset.c_str(), restauroRTC ? "RTC (reinício suave)" : "EEPROM",
+                releAtivado ? "LIGADO" : "DESLIGADO", vagAtuador, pressaoAplicada);
+  Serial.printf("📂 Estado | modo=%s | setpoint=%.1f°C | pressão salva=%.1f%%\n",
+                estadoControladora == 1 ? "AUTOMÁTICO" : "FORÇADO", setpoint, pressaoSetpoint);
+
+  carregarAgendaNVS();
   sensors.begin();
+  sensors.setResolution(12);
 
   client.onMessage(messageReceived);
-  pid1.SetOutputLimits(0, 255);
-  pid1.SetMode(MANUAL);
+  pid1.SetOutputLimits(0, 100);          // saída em %; conversão para o DAC só em saidaAnalogica()
+  pid1.SetSampleTime(CICLO_PID_MS);      // = intervalo real entre Compute()
+  pid1.SetMode(MANUAL);                  // vai para AUTOMATIC (a partir de vagPid) na 1ª leitura válida
 
   pinMode(BTN_WIFI,         INPUT_PULLUP);
   pinMode(BTN_AUTO_MANUAL,  INPUT_PULLUP);
   pinMode(BTN_STATUS,       INPUT_PULLUP);
   pinMode(LED_PIN,          OUTPUT);
-  pinMode(RELE1_PIN,        OUTPUT);
-  pinMode(RELE2_PIN,        OUTPUT);
-  pinMode(RELE3_PIN,        OUTPUT);
-  pinMode(RELE4_PIN,        OUTPUT);
-  pinMode(PWM_PIN1,         OUTPUT);
-
   digitalWrite(LED_PIN,   LOW);
-  digitalWrite(RELE1_PIN, RELE_DESLIGADO);
-  digitalWrite(RELE2_PIN, RELE_DESLIGADO);
-  digitalWrite(RELE3_PIN, RELE_DESLIGADO);
-  digitalWrite(RELE4_PIN, RELE_DESLIGADO);
 
-  // ✅ ID gerado antes do autoConnect para usar no nome do AP
+  // ✅ ID gerado antes do Wi-Fi para usar no nome do AP
   mqtt_id = getShortUniqueID();
 
   String prefix = "TJS/" + mqtt_id;
@@ -820,68 +1238,87 @@ void setup() {
   topic_online      = prefix + "/ONLINE";
   topic_schedule       = prefix + "/SCHEDULE/SET";
   topic_schedule_state = prefix + "/SCHEDULE/STATE";
+  topic_cmd_estado     = prefix + "/CMD";
+  topic_estado_real    = prefix + "/ESTADO";
+  topic_pressao        = prefix + "/PRESSAO/SET";
+  topic_versao         = prefix + "/VERSAO";
+  topic_pressao_estado = prefix + "/PRESSAO";
+  topic_reset          = prefix + "/RESET";
+  topic_rssi           = prefix + "/RSSI";
+  topic_uptime         = prefix + "/UPTIME";
 
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   Serial.println("🔧 CONTROLADORA HVAC | ID: " + mqtt_id + " | v" FIRMWARE_VERSION);
   Serial.printf( "   RELE1   GPIO%-2d  NIVEL=%s\n", RELE1_PIN, RELE_LIGADO == HIGH ? "HIGH" : "LOW");
   Serial.printf( "   DS18B20 GPIO%-2d\n", ONE_WIRE_BUS);
-  Serial.printf( "   PWM     GPIO%-2d\n", PWM_PIN1);
+  Serial.printf( "   AO1 VAG GPIO%-2d (DAC1)\n", AO_VAG);
+  Serial.printf( "   AO2 PRS GPIO%-2d (DAC2)\n", AO_PRESSAO);
   Serial.printf( "   STATUS  GPIO%-2d\n", BTN_STATUS);
   Serial.printf( "   AUTO/MN GPIO%-2d\n", BTN_AUTO_MANUAL);
-  Serial.printf( "   BTN_WIFI GPIO%-2d | curto=OTA | longo(5s)=reset WiFi\n", BTN_WIFI);
+  Serial.printf( "   BTN_WIFI GPIO%-2d | curto=OTA | longo(5s)=portal Wi-Fi\n", BTN_WIFI);
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-  wifiManager.setAPCallback(cbPortalIniciado);
-  wifiManager.setSaveConfigCallback(cbWifiSalvo);
-  wifiManager.setConfigPortalTimeout(300);
-
-  // ✅ Task LED iniciada ANTES do autoConnect (que é bloqueante)
+  // ✅ Task LED independente do loop()
   xTaskCreate(taskLED, "LED", 2048, NULL, 1, NULL);
 
-  // ✅ AP com nome incluindo ID da controladora
+  // 2) Wi-Fi: tenta as credenciais salvas por até 20 s; sem rede, segue para o loop
+  WiFi.persistent(true);
+  WiFi.mode(WIFI_STA);
+  configurarWifi();
+  wifiManager.setAPCallback(cbPortalIniciado);
+  wifiManager.setSaveConfigCallback(cbWifiSalvo);
+  wifiManager.setConfigPortalBlocking(false);
+  wifiManager.setConfigPortalTimeout(300);
+  wifiManager.setConnectTimeout(20);
+  wifiManager.setEnableConfigPortal(false);   // portal só pelo botão (ou sem credenciais)
+
   String apNome = "AutoConnect_" + mqtt_id;
-  Serial.println("🔌 Conectando Wi-Fi...");
-  Serial.println("   Se não conectar → AP: " + apNome);
-  if (!wifiManager.autoConnect(apNome.c_str())) {
-    Serial.println("❌ Portal AP timeout. Reiniciando...");
-    delay(1000);
-    ESP.restart();
+  if (!wifiManager.getWiFiIsSaved()) {
+    Serial.println("📶 Sem credenciais Wi-Fi salvas → portal aberto");
+    abrirPortalWifi();
+  } else {
+    Serial.println("🔌 Conectando Wi-Fi (até 20 s)...");
+    if (wifiManager.autoConnect(apNome.c_str())) {
+      Serial.print("✅ Wi-Fi OK | IP: ");
+      Serial.println(WiFi.localIP());
+    } else {
+      Serial.println("⚠️ Wi-Fi não conectou — seguindo sem rede (recuperação automática no loop)");
+    }
   }
-  Serial.print("✅ Wi-Fi OK | IP: ");
-  Serial.println(WiFi.localIP());
+  configurarWifi();   // WiFiManager mexe no modo; reaplica sleep/auto-reconnect
 
+  // 3) NTP sem esperar: a agenda aguarda a hora válida sozinha
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  Serial.println("🕐 Sincronizando NTP...");
-  struct tm t;
-  for (int i = 0; i < 10 && !getLocalTime(&t); i++) delay(1000);
-  if (getLocalTime(&t))
-    Serial.printf("✅ Hora: %02d:%02d:%02d\n", t.tm_hour, t.tm_min, t.tm_sec);
-  else
-    Serial.println("⚠️ NTP não sincronizou no setup");
 
+  // 4) MQTT com timeouts curtos para nada travar o loop por mais de ~3 s
+  net.setTimeout(3);           // SEGUNDOS no core 2.0.x (connect TCP)
+  client.setTimeout(2000);     // ms — comandos MQTT (CONNACK, SUBACK…)
   client.begin(mqtt_server, net);
-  client.setKeepAlive(20);   // mais tolerante a bloqueios curtos do loop() (ping, reconnect)
+  client.setKeepAlive(20);
   client.setWill(topic_online.c_str(), "0", true, 1); // LWT: broker publica "0" retido se cair sem aviso
   reconnectMQTT();
-
-  // Sem janela local: restaura o último estado do relé; a agenda corrige no próximo evento
-  if (EEPROM.read(ADDR_RELE1) == RELE_LIGADO) ligarRele("restauro pós-boot");
+  tsMqttOK = millis();         // conta os 30 min do degrau d a partir do boot
 
   pingOK = pingInternet();
   if (pingOK) ultimoPingOK = millis();
   tsPing = millis();
+
+  // 5) Watchdog do loop principal
+  esp_err_t wdt = esp_task_wdt_init(WDT_TIMEOUT_S, true);   // reconfigura se o core já iniciou
+  if (wdt == ESP_OK) wdt = esp_task_wdt_add(NULL);
+  Serial.printf("🐕 Watchdog %lus: %s\n", (unsigned long)WDT_TIMEOUT_S, wdt == ESP_OK ? "OK" : esp_err_to_name(wdt));
 }
 
 // ─── LOOP ─────────────────────────────────────────────────────────────────────
 void loop() {
+  esp_task_wdt_reset();
   client.loop();
   delay(10);
 
-  static unsigned long tReconnect = 0;
-  if (!client.connected() && millis() - tReconnect >= 5000UL) {
-    tReconnect = millis();
-    reconnectMQTT();
-  }
+  if (wifiManager.getConfigPortalActive()) wifiManager.process();
+  portalAtivo = wifiManager.getConfigPortalActive();   // inclui fechamento por timeout
+
+  verificarRede();
 
   lerEPublicarEntradas();
 
@@ -892,27 +1329,32 @@ void loop() {
 
   // LED controlado pela taskLED (FreeRTOS) — independente do loop()
 
-  if (millis() - tsPing >= 60000UL) {
+  if (millis() - tsPing >= PING_MS) {
     tsPing = millis();
     pingOK = pingInternet();
     if (pingOK) ultimoPingOK = millis();
-    else Serial.printf("❌ Ping falhou | sem internet há %lu min\n",
+    else Serial.printf("❌ Ping falhou | sem internet há %lu min (só diagnóstico)\n",
                        (millis() - ultimoPingOK) / 60000UL);
   }
 
-  if (millis() - ultimoPingOK > 7200000UL) {
-    Serial.println("❌ Sem internet há 2h. Reiniciando...");
-    delay(100);
-    ESP.restart();
+  static unsigned long tsDiag = 0;
+  if (millis() - tsDiag >= DIAG_MS) {
+    tsDiag = millis();
+    if (client.connected()) publicarDiagnostico();
   }
 
-  if (millis() - ts1 >= 30000UL) {
-    ts1 = millis();
+  if (millis() - ts1 >= CICLO_PID_MS) {
     Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    Serial.printf("🔁 CICLO 30s | ESTADO: %s | Relé: %s\n",
+    Serial.printf("🔁 CICLO 30s | ESTADO: %s | Relé: %s | Wi-Fi: %s | MQTT: %s\n",
                   estadoControladora == 1 ? "AUTOMÁTICO" : "FORÇADO",
-                  releAtivado ? "LIGADO" : "DESLIGADO");
+                  releAtivado ? "LIGADO" : "DESLIGADO",
+                  WiFi.status() == WL_CONNECTED ? "OK" : "FORA",
+                  client.connected() ? "OK" : "FORA");
     vagPID();
+    salvarRTC();   // vagPid muda a cada Compute() mesmo sem mexer no atuador
+    // ts1 marcado DEPOIS do Compute(): garante >= CICLO_PID_MS entre chamadas, senão o
+    // PID_v1 (SetSampleTime igual ao ciclo) pularia um Compute() por jitter de 1 ms.
+    ts1 = millis();
     Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   }
 }
