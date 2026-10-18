@@ -15,6 +15,7 @@
 #include <ElegantOTA.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
+#include <esp_ota_ops.h>
 #include <driver/gpio.h>
 
 // ─── Controle da VAG — parâmetros de sintonia ─────────────────────────────────
@@ -50,6 +51,7 @@ const unsigned long DEBOUNCE_MS    = 200UL;                // entradas MODO / ST
 
 // ─── Recuperação de rede (degraus, sem bloquear o loop) ──────────────────────
 const unsigned long MQTT_RETRY_MS        = 5000UL;      // a) MQTT caiu com Wi-Fi OK → tenta a cada 5 s
+const unsigned long MQTT_RETRY_CRED_MS   = 60000UL;     //    broker recusou usuário/senha → tenta a cada 60 s, sem degraus c/d
 const unsigned long WIFI_RECONNECT_MS    = 30000UL;     // b) Wi-Fi fora > 30 s → WiFi.reconnect()
 const unsigned long WIFI_RESET_PILHA_MS  = 180000UL;    // c) Wi-Fi fora > 3 min → reinicia a pilha Wi-Fi (repete a cada 3 min)
 const unsigned long MQTT_RESET_PILHA_MS  = 600000UL;    //    MQTT fora > 10 min com Wi-Fi OK → também reinicia a pilha (degrau c)
@@ -93,6 +95,7 @@ String topic_cmd_estado;      // TJS/<id>/CMD     — estado real do relé (reti
 String topic_estado_real;     // TJS/<id>/ESTADO  — modo real AUTOMÁTICO/FORÇADO (retido)
 String topic_pressao;         // TJS/<id>/PRESSAO/SET
 String topic_versao;          // TJS/<id>/VERSAO
+String topic_modelo;          // TJS/<id>/MODELO  — modelo da controladora (retido)
 String topic_pressao_estado;  // TJS/<id>/PRESSAO — valor aplicado na AO2 (retido)
 String topic_reset;           // TJS/<id>/RESET   — motivo do último reinício (retido)
 String topic_rssi;            // TJS/<id>/RSSI    — dBm (retido, a cada 5 min)
@@ -125,7 +128,10 @@ String topic_ota_state;       // TJS/<id>/OTA/STATE
 #define ADDR_PRESSAO     12   // float (4 bytes) — setpoint de pressão (%) persistido
 
 // ─── Versão do firmware ───────────────────────────────────────────────────────
-#define FIRMWARE_VERSION "1.4.0"
+#define FIRMWARE_VERSION "1.4.2"
+
+// ─── Modelo da controladora ───────────────────────────────────────────────────
+#define MODELO_CONTROLADORA "FC300"
 
 // ─── OTA ──────────────────────────────────────────────────────────────────────
 // Senha do AP OTA e do ElegantOTA (usuário "admin"). Mínimo 8 caracteres (WPA2).
@@ -137,6 +143,46 @@ static_assert(sizeof(OTA_SECRET) - 1 >= 8, "OTA_SECRET precisa ter pelo menos 8 
 
 WebServer otaServer(80);
 #define OTA_TIMEOUT_MS 300000UL
+
+// ─── OTA remoto — URL permitida e CA fixado ──────────────────────────────────
+// Só baixa de URLs que comecem EXATAMENTE com este prefixo (https, domínio fixo do BMS).
+#define OTA_URL_PREFIX "https://bmstjs.pilaresautomacao.com.br/firmware/"
+
+// ISRG Root X1 (Let's Encrypt) — raiz autoassinada, válida até 2035-06-04.
+// SHA-256: 96:BC:EC:06:26:49:76:F3:74:60:77:9A:CF:28:C5:A7:CF:E8:A3:C0:AA:E1:1A:8F:FC:EE:05:C0:BD:DF:08:C6
+static const char OTA_ROOT_CA[] = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+)EOF";
 
 // ─── Variáveis ────────────────────────────────────────────────────────────────
 unsigned long buttonPressStartTime = 0;
@@ -436,7 +482,7 @@ void entrarModoOTA() {
       "border-radius:6px;font-size:16px}"
       ".btn2{background:#28a745}.btn3{background:#dc3545}.btn4{background:#6f42c1}</style></head><body>"
       "<h2>🔧 HVAC Controladora</h2>"
-      "<p><b>ID:</b> " + mqtt_id + " &nbsp;|&nbsp; <b>v" FIRMWARE_VERSION "</b></p>"
+      "<p><b>ID:</b> " + mqtt_id + " &nbsp;|&nbsp; <b>" MODELO_CONTROLADORA "</b> &nbsp;|&nbsp; <b>v" FIRMWARE_VERSION "</b></p>"
       "<p><b>IP AP:</b> " + WiFi.softAPIP().toString() + "</p>"
       "<br>"
       "<a class='btn' href='/update'>📦 Atualizar Firmware</a><br>"
@@ -831,15 +877,116 @@ static int lerComDebounce(uint8_t pino, Debounce& d) {
   return d.estavel;
 }
 
-// ─── OTA remoto (pull por HTTP/HTTPS, disparado por MQTT) ─────────────────────
-// Comando:  TJS/<id>/OTA/SET   payload "VERSAO;URL;MD5"   (NÃO retained)
+// ─── OTA remoto (pull por HTTPS, disparado por MQTT) ──────────────────────────
+// Comando:  TJS/<id>/OTA/SET   payload "VERSAO;URL;MD5"   (NÃO retained — retido é ignorado)
 //   VERSAO  versão que o binário contém (ignorado se já for a versão atual — evita laço de reflash)
-//   URL     http:// ou https:// do firmware.bin (precisa de Content-Length)
+//   URL     precisa começar EXATAMENTE com OTA_URL_PREFIX (precisa de Content-Length)
 //   MD5     32 hex do .bin — o Update recusa a imagem se não bater
-// Estado:   TJS/<id>/OTA/STATE (retained): baixando / ok / erro: ... / ignorado: ...
+// Estado:   TJS/<id>/OTA/STATE (retained): baixando / ok / erro: ... / ignorado: ... / rollback
 // SEGURANÇA: quem publica em OTA/SET troca o firmware. Restrinja por ACL no broker (só o BMS).
 bool   otaPendente = false;
 String otaVersao, otaUrl, otaMd5;
+
+// ─── Validação pós-OTA remoto (rollback controlado pelo NVS) ─────────────────
+// Após gravar a imagem nova: NVS ota_pendente=1, ota_versao, ota_part_ant (partição que rodava).
+// No boot com ota_pendente=1: confirma 60 s depois da 1ª conexão MQTT; se o MQTT não conectar
+// em 5 min → volta para ota_part_ant. Os 5 min só contam a partir da 1ª conexão Wi-Fi deste
+// boot: falta de Wi-Fi não é defeito da imagem e não provoca rollback.
+const unsigned long OTA_CONFIRMA_MS = 60000UL;    // loop rodando 60 s com MQTT já conectado
+const unsigned long OTA_ROLLBACK_MS = 300000UL;   // 5 min sem MQTT, contados da conexão Wi-Fi
+bool          otaValidando    = false;
+String        otaPartAnterior;
+unsigned long tsOtaWifi       = 0;    // 1ª conexão Wi-Fi deste boot (0 = ainda não)
+unsigned long tsOtaMqtt       = 0;    // 1ª conexão MQTT deste boot (0 = ainda não)
+
+static void gravarOtaPendente(const String& versao) {
+  const char* atual = esp_ota_get_running_partition()->label;
+  prefs.begin("hvac", false);
+  prefs.putUChar("ota_pendente", 1);
+  prefs.putString("ota_versao", versao);
+  prefs.putString("ota_part_ant", atual);
+  prefs.end();
+  Serial.printf("💾 OTA pendente de validação: v%s | partição anterior: %s\n", versao.c_str(), atual);
+}
+
+static void limparOtaPendente() {
+  prefs.begin("hvac", false);
+  prefs.putUChar("ota_pendente", 0);
+  prefs.end();
+  otaValidando = false;
+}
+
+// setup(): a imagem atual veio de um OTA remoto e ainda não foi confirmada?
+void iniciarValidacaoOta() {
+  prefs.begin("hvac", false);
+  bool   pendente = prefs.getUChar("ota_pendente", 0) == 1;
+  String versao   = prefs.getString("ota_versao", "");
+  otaPartAnterior = prefs.getString("ota_part_ant", "");
+  prefs.end();
+  if (!pendente) return;
+
+  const char* atual = esp_ota_get_running_partition()->label;
+  if (otaPartAnterior.length() == 0 || otaPartAnterior == atual) {
+    // Está rodando a própria partição "anterior": a troca não aconteceu ou já foi revertida
+    Serial.printf("ℹ️ OTA pendente descartado: rodando a partição anterior (%s)\n", atual);
+    limparOtaPendente();
+    return;
+  }
+  otaValidando = true;
+  Serial.printf("🧪 Boot pós-OTA v%s (%s): confirma 60 s após o MQTT conectar; "
+                "sem MQTT em 5 min (contados do Wi-Fi) volta para %s\n",
+                versao.c_str(), atual, otaPartAnterior.c_str());
+}
+
+// Rollback feito por uma versão >= 1.4.1 que não pôde publicar: avisa assim que o MQTT conectar
+static void publicarRollbackPendente() {
+  prefs.begin("hvac", false);
+  bool houve = prefs.isKey("ota_rollback");
+  if (houve) prefs.remove("ota_rollback");
+  prefs.end();
+  if (houve) mqttPublish(topic_ota_state, "rollback", true);
+}
+
+static void reverterOta() {
+  Serial.printf("❌ OTA não validado: MQTT não conectou em 5 min — voltando para %s\n", otaPartAnterior.c_str());
+  const esp_partition_t* anterior = esp_partition_find_first(ESP_PARTITION_TYPE_APP,
+                                                             ESP_PARTITION_SUBTYPE_ANY,
+                                                             otaPartAnterior.c_str());
+  esp_err_t err = anterior ? esp_ota_set_boot_partition(anterior) : ESP_ERR_NOT_FOUND;
+  limparOtaPendente();
+  if (err != ESP_OK) {
+    Serial.printf("   ⚠️ Rollback impossível (%s) — seguindo nesta versão\n", esp_err_to_name(err));
+    return;
+  }
+  prefs.begin("hvac", false);
+  prefs.putString("ota_rollback", FIRMWARE_VERSION);   // a versão anterior publica "rollback" ao conectar
+  prefs.end();
+  if (client.connected()) mqttPublish(topic_ota_state, "rollback", true);
+  reinicioSuave("OTA_ROLLBACK");
+}
+
+// loop(): confirma ou reverte a imagem pós-OTA
+void verificarValidacaoOta() {
+  if (!otaValidando) return;
+  unsigned long agora = millis();
+
+  if (tsOtaWifi == 0) {
+    if (WiFi.status() != WL_CONNECTED) return;   // Wi-Fi nunca conectou: espera, sem rollback
+    tsOtaWifi = agora;
+    Serial.println("🧪 Wi-Fi conectado — MQTT tem 5 min para conectar");
+  }
+  if (tsOtaMqtt == 0 && client.connected()) tsOtaMqtt = agora;
+
+  if (tsOtaMqtt) {
+    if (agora - tsOtaMqtt >= OTA_CONFIRMA_MS) {
+      esp_ota_mark_app_valid_cancel_rollback();   // no-op se o core já marcou a imagem como válida
+      limparOtaPendente();
+      Serial.println("✅ OTA confirmado: imagem " FIRMWARE_VERSION " validada");
+    }
+    return;
+  }
+  if (agora - tsOtaWifi >= OTA_ROLLBACK_MS) reverterOta();
+}
 
 static bool md5Valido(const String& s) {
   if (s.length() != 32) return false;
@@ -848,6 +995,11 @@ static bool md5Valido(const String& s) {
 }
 
 static void receberComandoOta(const String& payload) {
+  if (otaValidando) {   // gravar agora sobrescreveria a partição anterior (alvo do rollback)
+    Serial.println("   ℹ️ OTA ignorado: a versão atual ainda está em validação pós-OTA");
+    mqttPublish(topic_ota_state, "ignorado: validacao pos-OTA em andamento", true);
+    return;
+  }
   int p1 = payload.indexOf(';');
   int p2 = payload.lastIndexOf(';');
   if (p1 < 0 || p2 <= p1) { mqttPublish(topic_ota_state, "erro: formato VERSAO;URL;MD5", true); return; }
@@ -862,24 +1014,23 @@ static void receberComandoOta(const String& payload) {
     mqttPublish(topic_ota_state, "ignorado: ja na versao " + versao, true);
     return;
   }
-  if (!(url.startsWith("http://") || url.startsWith("https://"))) { mqttPublish(topic_ota_state, "erro: url deve ser http(s)", true); return; }
-  if (!md5Valido(md5))                                           { mqttPublish(topic_ota_state, "erro: md5 invalido", true); return; }
+  if (!url.startsWith(OTA_URL_PREFIX)) { mqttPublish(topic_ota_state, "erro: url nao permitida", true); return; }
+  if (!md5Valido(md5))                 { mqttPublish(topic_ota_state, "erro: md5 invalido", true); return; }
 
   otaVersao = versao; otaUrl = url; otaMd5 = md5;
   otaPendente = true;   // o download roda no loop(), fora do callback do MQTT
 }
 
-// Baixa e grava no slot OTA inativo. A imagem só vira ativa se o MD5 conferir.
+// Baixa por HTTPS (servidor validado pelo ISRG Root X1) e grava no slot OTA inativo.
+// A imagem só vira ativa se o MD5 conferir.
 static bool baixarEAplicar(const String& url, const String& md5, String& erro) {
-  WiFiClient       plano;
   WiFiClientSecure seguro;
-  seguro.setInsecure();   // sem CA embarcada: a integridade vem do MD5 recebido pelo broker
+  seguro.setCACert(OTA_ROOT_CA);
   HTTPClient http;
   http.setConnectTimeout(10000);
   http.setTimeout(15000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  bool iniciou = url.startsWith("https://") ? http.begin(seguro, url) : http.begin(plano, url);
-  if (!iniciou) { erro = "url invalida"; return false; }
+  if (!http.begin(seguro, url)) { erro = "url invalida"; return false; }
 
   int code = http.GET();
   if (code != HTTP_CODE_OK) { erro = "http " + String(code); http.end(); return false; }
@@ -894,6 +1045,7 @@ static bool baixarEAplicar(const String& url, const String& md5, String& erro) {
   int  recebido = 0;
   unsigned long tDado = millis(), tLoop = millis(), tLog = millis();
   while (recebido < total) {
+    esp_task_wdt_reset();   // download lento não pode estourar o watchdog do loop
     size_t disp = stream->available();
     if (disp) {
       int n = stream->readBytes(buf, disp > sizeof(buf) ? sizeof(buf) : disp);
@@ -924,11 +1076,12 @@ void executarOtaRemota() {
 
   String erro;
   if (baixarEAplicar(otaUrl, otaMd5, erro)) {
+    gravarOtaPendente(otaVersao);   // Update.end() OK: a nova imagem precisa se validar no boot
     Serial.println("✅ OTA remoto concluído. Reiniciando...");
     mqttPublish(topic_ota_state, "ok " + otaVersao + " reiniciando", true);
     client.loop();
     delay(500);
-    ESP.restart();
+    reinicioSuave("OTA_REMOTO");    // relés/AO travados no nível atual durante o reinício
   } else {
     Serial.printf("❌ OTA remoto falhou: %s\n", erro.c_str());
     mqttPublish(topic_ota_state, "erro: " + erro, true);
@@ -1079,11 +1232,13 @@ bool reconnectMQTT() {
     mqttPublish(topic_cmd_estado,  releAtivado ? "true" : "false", true);
     mqttPublish(topic_estado_real, estadoControladora == 1 ? "true" : "false", true);
     mqttPublish(topic_versao,      FIRMWARE_VERSION, true);
+    mqttPublish(topic_modelo,      MODELO_CONTROLADORA, true);
     if (pressaoAplicada >= 0) mqttPublish(topic_pressao_estado, String(pressaoAplicada, 1), true);
     mqttPublish(topic_reset, motivoReset, true);
     publicarDiagnostico();
     client.publish(topic_online.c_str(), "1", true, 1); // confirma presença (retido, QoS 1)
     publicarEstadoAgenda();
+    publicarRollbackPendente();
     vagPublicada = -1;   // VAG republicada no próximo ciclo do PID
     return true;
   }
@@ -1111,6 +1266,7 @@ uint8_t       degrauWifi     = 0;      // 0 = nenhum | 1 = reconnect (b) | 2 = p
 unsigned long tsMqttOK       = 0;      // última vez que o MQTT estava conectado
 unsigned long tsResetPilha   = 0;      // último degrau c
 bool          pilhaResetadaSemMqtt = false;   // houve degrau c desde a última conexão MQTT
+bool          credMqttRecusada     = false;   // broker recusou usuário/senha na última tentativa
 
 // c) Wi-Fi off/on e begin() com as credenciais salvas (NVS). Bloqueia ~0,3 s.
 static void reiniciarPilhaWifi(const char* porque) {
@@ -1141,6 +1297,7 @@ void verificarRede() {
     if (client.connected()) {
       tsMqttOK = agora;
       pilhaResetadaSemMqtt = false;
+      credMqttRecusada     = false;
       if (rtcEstado.reiniciosMqtt != 0) {   // problema resolvido: degrau d volta para 30 min
         rtcEstado.reiniciosMqtt = 0;
         salvarRTC();
@@ -1148,14 +1305,18 @@ void verificarRede() {
       return;
     }
 
-    // a) MQTT fora com Wi-Fi OK → tenta a cada 5 s
+    // a) MQTT fora com Wi-Fi OK → tenta a cada 5 s (60 s se o broker recusou a credencial)
     static unsigned long tReconnect = 0;
-    if (agora - tReconnect >= MQTT_RETRY_MS) {
+    if (agora - tReconnect >= (credMqttRecusada ? MQTT_RETRY_CRED_MS : MQTT_RETRY_MS)) {
       tReconnect = agora;
       Serial.printf("🔄 [a] MQTT fora há %lus com Wi-Fi OK\n", (agora - tsMqttOK) / 1000UL);
-      reconnectMQTT();
-      if (client.connected()) return;
+      if (reconnectMQTT()) { credMqttRecusada = false; return; }
+      credMqttRecusada = brokerRecusouCredenciais();
+      if (credMqttRecusada)
+        Serial.println("🔒 CREDENCIAL MQTT RECUSADA pelo broker — nova tentativa em 60 s (corrija no portal Wi-Fi)");
     }
+    // Credencial recusada: rede e broker estão OK — reiniciar pilha/placa não resolve
+    if (credMqttRecusada) return;
 
     unsigned long semMqtt = agora - tsMqttOK;
     if (semMqtt > MQTT_RESET_PILHA_MS && !pilhaResetadaSemMqtt) {
@@ -1260,6 +1421,47 @@ void messageReceived(String &topic, String &payload) {
     }
   }
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+}
+
+// ─── Flag "retained" das mensagens recebidas ─────────────────────────────────
+// A lib MQTT 2.5.2 não repassa a flag retained ao onMessageAdvanced (só tópico/bytes/tamanho),
+// mas o lwmqtt interno a recebe. Este gancho fica entre o lwmqtt e o handler da lib: anota a
+// flag e repassa a mensagem sem alterar nada. O lwmqtt_client_t é membro privado de MQTTClient;
+// o acesso usa instanciação explícita de template (o padrão C++ libera membros privados nela).
+// Depende do layout da lib 2.5.2 (versão fixada no platformio.ini).
+template <typename Tag, typename Tag::tipo M>
+struct AcessoPrivado { friend typename Tag::tipo membro(Tag) { return M; } };
+struct TagLwmqtt { typedef lwmqtt_client_t MQTTClient::*tipo; friend tipo membro(TagLwmqtt); };
+template struct AcessoPrivado<TagLwmqtt, &MQTTClient::client>;
+
+static lwmqtt_callback_t mqttHandlerLib = nullptr;
+static bool              mqttMsgRetida  = false;   // flag da mensagem sendo entregue agora
+
+static void mqttGanchoRetido(lwmqtt_client_t* c, void* ref, lwmqtt_string_t topico, lwmqtt_message_t msg) {
+  mqttMsgRetida = msg.retained;
+  mqttHandlerLib(c, ref, topico, msg);   // → MQTTClientHandler da lib → mqttMensagemRecebida
+  mqttMsgRetida = false;
+}
+
+// Chamar uma vez, DEPOIS de client.begin() (que registra o handler da lib)
+static void instalarGanchoRetido() {
+  lwmqtt_client_t* lw = &(client.*membro(TagLwmqtt()));
+  mqttHandlerLib = lw->callback;
+  lwmqtt_set_callback(lw, lw->callback_ref, mqttGanchoRetido);
+}
+
+// onMessageAdvanced: OTA/SET retido é descartado; o resto segue para messageReceived()
+void mqttMensagemRecebida(MQTTClient* c, char topico[], char bytes[], int tamanho) {
+  String topic(topico);
+  String payload;
+  if (bytes != nullptr) payload = String((const char*)bytes);   // mesmo tratamento do onMessage simples
+
+  if (mqttMsgRetida && topic == topic_ota) {
+    Serial.printf("📩 RECEBIDO  [%s] → \"%s\" 📌\n", topic.c_str(), payload.c_str());
+    Serial.println("   ⚠️ OTA retido ignorado");
+    return;
+  }
+  messageReceived(topic, payload);
 }
 
 // ─── PID + VAG (chamado a cada CICLO_PID_MS) ──────────────────────────────────
@@ -1412,11 +1614,12 @@ void setup() {
   Serial.printf("🔢 Contadores RTC | reiniciosMqtt=%u | bootsRuins=%u\n",
                 rtcEstado.reiniciosMqtt, rtcEstado.bootsRuins);
 
+  iniciarValidacaoOta();
   carregarAgendaNVS();
   sensors.begin();
   sensors.setResolution(12);
 
-  client.onMessage(messageReceived);
+  client.onMessageAdvanced(mqttMensagemRecebida);
   pid1.SetOutputLimits(0, 100);          // saída em %; conversão para o DAC só em saidaAnalogica()
   pid1.SetSampleTime(CICLO_PID_MS);      // = intervalo real entre Compute()
   pid1.SetMode(MANUAL);                  // vai para AUTOMATIC (a partir de vagPid) na 1ª leitura válida
@@ -1445,6 +1648,7 @@ void setup() {
   topic_estado_real    = prefix + "/ESTADO";
   topic_pressao        = prefix + "/PRESSAO/SET";
   topic_versao         = prefix + "/VERSAO";
+  topic_modelo         = prefix + "/MODELO";
   topic_pressao_estado = prefix + "/PRESSAO";
   topic_reset          = prefix + "/RESET";
   topic_rssi           = prefix + "/RSSI";
@@ -1460,7 +1664,7 @@ void setup() {
   carregarCredMqtt();
 
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  Serial.println("🔧 CONTROLADORA HVAC | ID: " + mqtt_id + " | v" FIRMWARE_VERSION);
+  Serial.println("🔧 CONTROLADORA HVAC " MODELO_CONTROLADORA " | ID: " + mqtt_id + " | v" FIRMWARE_VERSION);
   Serial.printf( "   RELE1   GPIO%-2d  NIVEL=%s\n", RELE1_PIN, RELE_LIGADO == HIGH ? "HIGH" : "LOW");
   Serial.printf( "   DS18B20 GPIO%-2d\n", ONE_WIRE_BUS);
   Serial.printf( "   AO1 VAG GPIO%-2d (DAC1)\n", AO_VAG);
@@ -1503,7 +1707,7 @@ void setup() {
     }
   }
   configurarWifi();   // WiFiManager mexe no modo; reaplica sleep/auto-reconnect
-  if (credMqttAlteradas) aplicarCredMqttDoPortal();   // portal foi usado → grava usuário/senha MQTT no NVS
+  if (credMqttAlteradas) { credMqttAlteradas = false; aplicarCredMqttDoPortal(); }   // portal foi usado → grava usuário/senha MQTT no NVS
 
   // 3) NTP sem esperar: a agenda aguarda a hora válida sozinha
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
@@ -1512,6 +1716,7 @@ void setup() {
   net.setTimeout(3);           // SEGUNDOS no core 2.0.x (connect TCP)
   client.setTimeout(2000);     // ms — comandos MQTT (CONNACK, SUBACK…)
   client.begin(mqtt_server, net);
+  instalarGanchoRetido();      // depois do begin(): expõe a flag retained ao callback
   client.setKeepAlive(20);
   client.setWill(topic_online.c_str(), "0", true, 1); // LWT: broker publica "0" retido se cair sem aviso
   reconnectMQTT();
@@ -1536,7 +1741,19 @@ void loop() {
   if (wifiManager.getConfigPortalActive()) wifiManager.process();
   portalAtivo = wifiManager.getConfigPortalActive();   // inclui fechamento por timeout
 
+  // Portal salvou (página Wi-Fi ou /param): o WiFiManager já copiou os campos antes do callback.
+  // Derruba o MQTT para o verificarRede() reconectar com as credenciais novas.
+  if (credMqttAlteradas) {
+    credMqttAlteradas = false;
+    aplicarCredMqttDoPortal();
+    client.disconnect();
+    net.stop();
+    credMqttRecusada = false;   // credencial nova: volta a tentar a cada 5 s
+  }
+
   verificarRede();
+
+  verificarValidacaoOta();
 
   executarOtaRemota();
 
