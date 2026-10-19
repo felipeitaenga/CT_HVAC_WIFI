@@ -146,8 +146,8 @@ String topic_setpoint_state;  // TJS/<id>/SETPOINT/STATE — setpoint efetivo (r
 // ─── Hardware ─────────────────────────────────────────────────────────────────
 #define ONE_WIRE_BUS    13
 // Saídas 0–10 V da KC868-A4: DAC do ESP32 (0–3,3 V) + amplificador ~3x. Só dacWrite, nunca PWM/LEDC.
-#define AO_VAG          25   // AO1 / DAC1 → atuador da VAG       (0–10 V = 0–100 %)
-#define AO_PRESSAO      26   // AO2 / DAC2 → inversor do ventilador (0–10 V = 0–100 %)
+#define AO_VAG          26   // AO1 (GPIO26) → atuador da VAG        (0–10 V = 0–100 %)
+#define AO_PRESSAO      25   // AO2 (GPIO25) → inversor do ventilador (0–10 V = 0–100 %)
 #define LED_PIN         22
 #define RELE1_PIN        2
 #define RELE2_PIN       15
@@ -168,7 +168,7 @@ String topic_setpoint_state;  // TJS/<id>/SETPOINT/STATE — setpoint efetivo (r
 #define ADDR_PRESSAO     12   // float (4 bytes) — setpoint de pressão (%) persistido
 
 // ─── Versão do firmware ───────────────────────────────────────────────────────
-#define FIRMWARE_VERSION "1.4.6"
+#define FIRMWARE_VERSION "1.4.7"
 
 // ─── Identificação da controladora (padrão comum: docs/PADRAO_CONTROLADORAS.md) ─
 #define TIPO_CONTROLADORA   "FANCOIL"
@@ -1938,8 +1938,8 @@ void setup() {
   Serial.println(String("   ") + NXFW_TAG);
   Serial.printf( "   RELE1   GPIO%-2d  NIVEL=%s\n", RELE1_PIN, RELE_LIGADO == HIGH ? "HIGH" : "LOW");
   Serial.printf( "   DS18B20 GPIO%-2d\n", ONE_WIRE_BUS);
-  Serial.printf( "   AO1 VAG GPIO%-2d (DAC1)\n", AO_VAG);
-  Serial.printf( "   AO2 PRS GPIO%-2d (DAC2)\n", AO_PRESSAO);
+  Serial.printf( "   AO1 VAG GPIO%-2d\n", AO_VAG);
+  Serial.printf( "   AO2 PRESSÃO GPIO%-2d\n", AO_PRESSAO);
   Serial.printf( "   STATUS  GPIO%-2d\n", BTN_STATUS);
   Serial.printf( "   AUTO/MN GPIO%-2d\n", BTN_AUTO_MANUAL);
   Serial.printf( "   BTN_WIFI GPIO%-2d | curto=OTA | longo(5s)=portal Wi-Fi\n", BTN_WIFI);

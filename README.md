@@ -11,6 +11,15 @@ ao supervisório NX-360 por MQTT. Código em `src/main.cpp`.
 
 Padrão comum de identificação/OTA de todas as controladoras: [docs/PADRAO_CONTROLADORAS.md](docs/PADRAO_CONTROLADORAS.md).
 
+## Saídas analógicas (KC868-A4)
+
+| Saída | GPIO | Uso em campo | Faixa |
+|---|---|---|---|
+| AO1 | GPIO26 | atuador da VAG | 0–10 V = 0–100 % |
+| AO2 | GPIO25 | inversor do ventilador (pressão) | 0–10 V = 0–100 % |
+
+Até a v1.4.6 os pinos estavam invertidos no firmware (VAG no GPIO25); corrigido na v1.4.7.
+
 ## Tópicos MQTT
 
 Prefixo `TJS/<id>/` (`<id>` = 4 últimos caracteres hex do MAC). Tópicos de estado são retidos.

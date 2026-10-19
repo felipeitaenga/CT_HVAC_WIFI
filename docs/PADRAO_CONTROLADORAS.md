@@ -143,6 +143,15 @@ Não fazem parte do contrato comum, mas servem de modelo para comandos JSON de o
 | `PID/STATE` | placa → BMS | sim | telemetria do controle a cada ciclo do PID (30 s) |
 | `SETPOINT/STATE` | placa → BMS | sim | setpoint efetivo, 1 casa (`23.0`) — na conexão e sempre que muda (`SETPOINT/SET`, agenda) |
 
+### Saídas analógicas (KC868-A4)
+
+| Saída | GPIO | Uso | Faixa |
+|---|---|---|---|
+| AO1 | GPIO26 | atuador da VAG (`VAG`, `vag` no `PID/STATE`) | 0–10 V = 0–100 % |
+| AO2 | GPIO25 | inversor do ventilador (`PRESSAO`) | 0–10 V = 0–100 % |
+
+Mapa corrigido na v1.4.7 (até a v1.4.6 a VAG estava no GPIO25).
+
 ### `PID/SET`
 
 ```json
