@@ -43,13 +43,15 @@ rodando; a que já recebeu mantém o perfil salvo, mesmo após atualizar o firmw
 
 | Perfil | Kp (%/°C) | Ti (s) | Taxa (%/ciclo) | Zona morta (°C) |
 |---|---|---|---|---|
-| `MUITO_LENTO` | 30 | 720 | 5 | 0.20 |
-| `LENTO` | 35 | 480 | 7 | 0.20 |
-| `NORMAL` (padrão de fábrica) | 40 | 300 | 10 | 0.20 |
-| `RAPIDO` | 50 | 200 | 15 | 0.15 |
-| `MUITO_RAPIDO` | 60 | 120 | 20 | 0.15 |
-| `PERSONALIZADO` | 5–100 | 60–3600 | 1–20 | 0.10–1.00 |
+| `MUITO_LENTO` | 45 | 290 | 10 | 0.20 |
+| `LENTO` | 52 | 190 | 14 | 0.20 |
+| `NORMAL` (padrão de fábrica) | 60 | 120 | 20 | 0.15 |
+| `RAPIDO` | 75 | 80 | 30 | 0.15 |
+| `MUITO_RAPIDO` | 90 | 50 | 40 | 0.10 |
+| `PERSONALIZADO` | 5–150 | 30–3600 | 1–50 | 0.10–1.00 |
 
+Tabela da v1.4.6 (perfis mais rápidos). Para perfil pronto, a NVS guarda só o nome e os valores
+vêm sempre da tabela do firmware: placas com perfil pronto salvo pegam os valores novos no update.
 Ciclo do PID fixo em 30 s, derivativo desligado.
 
 ```sh

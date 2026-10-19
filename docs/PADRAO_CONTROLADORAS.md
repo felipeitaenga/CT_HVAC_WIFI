@@ -152,14 +152,17 @@ Não fazem parte do contrato comum, mas servem de modelo para comandos JSON de o
 
 | Perfil | Kp (%/°C) | Ti (s) | Taxa (%/ciclo) | Zona morta (°C) |
 |---|---|---|---|---|
-| `MUITO_LENTO` | 30 | 720 | 5 | 0.20 |
-| `LENTO` | 35 | 480 | 7 | 0.20 |
-| `NORMAL` (padrão de fábrica) | 40 | 300 | 10 | 0.20 |
-| `RAPIDO` | 50 | 200 | 15 | 0.15 |
-| `MUITO_RAPIDO` | 60 | 120 | 20 | 0.15 |
-| `PERSONALIZADO` | 5–100 | 60–3600 | 1–20 | 0.10–1.00 |
+| `MUITO_LENTO` | 45 | 290 | 10 | 0.20 |
+| `LENTO` | 52 | 190 | 14 | 0.20 |
+| `NORMAL` (padrão de fábrica) | 60 | 120 | 20 | 0.15 |
+| `RAPIDO` | 75 | 80 | 30 | 0.15 |
+| `MUITO_RAPIDO` | 90 | 50 | 40 | 0.10 |
+| `PERSONALIZADO` | 5–150 | 30–3600 | 1–50 | 0.10–1.00 |
 
-- Perfil pronto: `kp/ti/taxa/zm` do payload são ignorados (vale a tabela).
+- Tabela da v1.4.6 (perfis mais rápidos que a da v1.4.4/1.4.5).
+- Perfil pronto: `kp/ti/taxa/zm` do payload são ignorados (vale a tabela). Ao carregar da NVS,
+  perfil pronto também usa os valores da tabela do firmware em execução — um update que muda a
+  tabela vale para todas as placas com perfil pronto; só o `PERSONALIZADO` guarda valores próprios.
 - Perfil desconhecido, campo faltando, JSON inválido ou valor fora da faixa: nada é aplicado e
   `PID/CONFIG` é republicado com a configuração atual mais `"erro"`. Motivos:
   `json invalido`, `perfil ausente`, `perfil desconhecido`, `campo ausente: <campo>`,

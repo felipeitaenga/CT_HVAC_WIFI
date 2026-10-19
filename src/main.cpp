@@ -28,13 +28,15 @@
 // Padrão de fábrica: NORMAL (desde a v1.4.5; até a v1.4.4 era MUITO_LENTO). O padrão NÃO é
 // gravado no NVS: sem PID/SET recebido a placa segue o padrão do firmware que estiver rodando;
 // depois do primeiro PID/SET ela mantém o perfil salvo.
+// Tabela da v1.4.6 (perfis mais rápidos). Perfil pronto salvo no NVS guarda só o NOME —
+// os valores vêm sempre desta tabela, então as placas pegam a tabela nova no update.
 //   Perfil         Kp(%/°C)  Ti(s)  Taxa(%/ciclo)  ZM(°C)
-//   MUITO_LENTO      30       720       5           0.20
-//   LENTO            35       480       7           0.20
-//   NORMAL           40       300      10           0.20   ← padrão de fábrica
-//   RAPIDO           50       200      15           0.15
-//   MUITO_RAPIDO     60       120      20           0.15
-//   PERSONALIZADO  livres: Kp 5–100 | Ti 60–3600 | Taxa 1–20 | ZM 0.10–1.00
+//   MUITO_LENTO      45       290      10           0.20
+//   LENTO            52       190      14           0.20
+//   NORMAL           60       120      20           0.15   ← padrão de fábrica
+//   RAPIDO           75        80      30           0.15
+//   MUITO_RAPIDO     90        50      40           0.10
+//   PERSONALIZADO  livres: Kp 5–150 | Ti 30–3600 | Taxa 1–50 | ZM 0.10–1.00
 // Troca de perfil é sem salto (SetTunings não zera a integral da PID_v1).
 //
 // Como escolher (troque UM degrau por vez e observe 1–2 h no PID/STATE):
@@ -47,26 +49,26 @@
 //  - Equilíbrio bom: temperatura dentro da zona morta, VAG parada num valor intermediário.
 struct PerfilPid { const char* nome; double kp, ti, taxa, zm; };
 const PerfilPid PERFIS_PID[] = {
-  {"MUITO_LENTO",  30.0, 720.0,  5.0, 0.20},
-  {"LENTO",        35.0, 480.0,  7.0, 0.20},
-  {"NORMAL",       40.0, 300.0, 10.0, 0.20},   // padrão de fábrica
-  {"RAPIDO",       50.0, 200.0, 15.0, 0.15},
-  {"MUITO_RAPIDO", 60.0, 120.0, 20.0, 0.15},
+  {"MUITO_LENTO",  45.0, 290.0, 10.0, 0.20},
+  {"LENTO",        52.0, 190.0, 14.0, 0.20},
+  {"NORMAL",       60.0, 120.0, 20.0, 0.15},   // padrão de fábrica
+  {"RAPIDO",       75.0,  80.0, 30.0, 0.15},
+  {"MUITO_RAPIDO", 90.0,  50.0, 40.0, 0.10},
 };
 const size_t N_PERFIS_PID = sizeof(PERFIS_PID) / sizeof(PERFIS_PID[0]);
 const PerfilPid& PERFIL_PID_PADRAO = PERFIS_PID[2];   // NORMAL
 // Faixas do PERSONALIZADO (também usadas para validar o que vem do NVS)
-const double PID_KP_MIN   = 5.0,  PID_KP_MAX   = 100.0;    // %/°C
-const double PID_TI_MIN   = 60.0, PID_TI_MAX   = 3600.0;   // s
-const double PID_TAXA_MIN = 1.0,  PID_TAXA_MAX = 20.0;     // %/ciclo
+const double PID_KP_MIN   = 5.0,  PID_KP_MAX   = 150.0;    // %/°C
+const double PID_TI_MIN   = 30.0, PID_TI_MAX   = 3600.0;   // s
+const double PID_TAXA_MIN = 1.0,  PID_TAXA_MAX = 50.0;     // %/ciclo
 const double PID_ZM_MIN   = 0.10, PID_ZM_MAX   = 1.00;     // °C
 
 // Sintonia em uso (carregada do NVS no setup; começa no padrão de fábrica NORMAL)
 String pidPerfil = "NORMAL";
-double pidKp     = 40.0;     // %/°C
-double pidTi     = 300.0;    // s — tempo integral (Ki = Kp / Ti)
-double pidTaxa   = 10.0;     // %  — variação máxima da saída por ciclo
-double pidZm     = 0.20;     // °C — |setpoint − temp filtrada| <= isto: mantém a saída
+double pidKp     = 60.0;     // %/°C
+double pidTi     = 120.0;    // s — tempo integral (Ki = Kp / Ti)
+double pidTaxa   = 20.0;     // %  — variação máxima da saída por ciclo
+double pidZm     = 0.15;     // °C — |setpoint − temp filtrada| <= isto: mantém a saída
 bool   pidSalvo  = false;    // true se o NVS tem um perfil válido gravado por PID/SET
 
 const double        VAG_KD         = 0.0;                  // D desligado: só amplificaria ruído do sensor
@@ -166,7 +168,7 @@ String topic_setpoint_state;  // TJS/<id>/SETPOINT/STATE — setpoint efetivo (r
 #define ADDR_PRESSAO     12   // float (4 bytes) — setpoint de pressão (%) persistido
 
 // ─── Versão do firmware ───────────────────────────────────────────────────────
-#define FIRMWARE_VERSION "1.4.5"
+#define FIRMWARE_VERSION "1.4.6"
 
 // ─── Identificação da controladora (padrão comum: docs/PADRAO_CONTROLADORAS.md) ─
 #define TIPO_CONTROLADORA   "FANCOIL"
@@ -805,9 +807,9 @@ static void receberComandoPid(const String& payload) {
       else if (!jsonNumero(js, "ti",   ti,   erro)) {}
       else if (!jsonNumero(js, "taxa", taxa, erro)) {}
       else if (!jsonNumero(js, "zm",   zm,   erro)) {}
-      else if (kp   < PID_KP_MIN   || kp   > PID_KP_MAX)   erro = "kp fora da faixa (5-100)";
-      else if (ti   < PID_TI_MIN   || ti   > PID_TI_MAX)   erro = "ti fora da faixa (60-3600)";
-      else if (taxa < PID_TAXA_MIN || taxa > PID_TAXA_MAX) erro = "taxa fora da faixa (1-20)";
+      else if (kp   < PID_KP_MIN   || kp   > PID_KP_MAX)   erro = "kp fora da faixa (5-150)";
+      else if (ti   < PID_TI_MIN   || ti   > PID_TI_MAX)   erro = "ti fora da faixa (30-3600)";
+      else if (taxa < PID_TAXA_MIN || taxa > PID_TAXA_MAX) erro = "taxa fora da faixa (1-50)";
       else if (zm   < PID_ZM_MIN   || zm   > PID_ZM_MAX)   erro = "zm fora da faixa (0.10-1.00)";
     } else {
       erro = "perfil desconhecido";
