@@ -96,6 +96,7 @@ String topic_estado_real;     // TJS/<id>/ESTADO  — modo real AUTOMÁTICO/FOR�
 String topic_pressao;         // TJS/<id>/PRESSAO/SET
 String topic_versao;          // TJS/<id>/VERSAO
 String topic_modelo;          // TJS/<id>/MODELO  — modelo da controladora (retido)
+String topic_tipo;            // TJS/<id>/TIPO    — tipo da controladora (retido)
 String topic_pressao_estado;  // TJS/<id>/PRESSAO — valor aplicado na AO2 (retido)
 String topic_reset;           // TJS/<id>/RESET   — motivo do último reinício (retido)
 String topic_rssi;            // TJS/<id>/RSSI    — dBm (retido, a cada 5 min)
@@ -128,10 +129,16 @@ String topic_ota_state;       // TJS/<id>/OTA/STATE
 #define ADDR_PRESSAO     12   // float (4 bytes) — setpoint de pressão (%) persistido
 
 // ─── Versão do firmware ───────────────────────────────────────────────────────
-#define FIRMWARE_VERSION "1.4.2"
+#define FIRMWARE_VERSION "1.4.3"
 
-// ─── Modelo da controladora ───────────────────────────────────────────────────
+// ─── Identificação da controladora (padrão comum: docs/PADRAO_CONTROLADORAS.md) ─
+#define TIPO_CONTROLADORA   "FANCOIL"
 #define MODELO_CONTROLADORA "FC300"
+
+// Assinatura gravada no .bin — o scripts/publicar_ota.py confere antes de distribuir.
+// Impressa no boot para o linker não descartar.
+extern "C" __attribute__((used)) const char NXFW_TAG[] =
+  "NXFW|TIPO=" TIPO_CONTROLADORA "|MODELO=" MODELO_CONTROLADORA "|VERSAO=" FIRMWARE_VERSION "|";
 
 // ─── OTA ──────────────────────────────────────────────────────────────────────
 // Senha do AP OTA e do ElegantOTA (usuário "admin"). Mínimo 8 caracteres (WPA2).
@@ -146,7 +153,7 @@ WebServer otaServer(80);
 
 // ─── OTA remoto — URL permitida e CA fixado ──────────────────────────────────
 // Só baixa de URLs que comecem EXATAMENTE com este prefixo (https, domínio fixo do BMS).
-#define OTA_URL_PREFIX "https://bmstjs.pilaresautomacao.com.br/firmware/"
+#define OTA_URL_PREFIX "https://bmstjs.pilaresautomacao.com.br/api/firmware/files/"
 
 // ISRG Root X1 (Let's Encrypt) — raiz autoassinada, válida até 2035-06-04.
 // SHA-256: 96:BC:EC:06:26:49:76:F3:74:60:77:9A:CF:28:C5:A7:CF:E8:A3:C0:AA:E1:1A:8F:FC:EE:05:C0:BD:DF:08:C6
@@ -482,7 +489,7 @@ void entrarModoOTA() {
       "border-radius:6px;font-size:16px}"
       ".btn2{background:#28a745}.btn3{background:#dc3545}.btn4{background:#6f42c1}</style></head><body>"
       "<h2>🔧 HVAC Controladora</h2>"
-      "<p><b>ID:</b> " + mqtt_id + " &nbsp;|&nbsp; <b>" MODELO_CONTROLADORA "</b> &nbsp;|&nbsp; <b>v" FIRMWARE_VERSION "</b></p>"
+      "<p><b>ID:</b> " + mqtt_id + " &nbsp;|&nbsp; <b>" TIPO_CONTROLADORA " " MODELO_CONTROLADORA "</b> &nbsp;|&nbsp; <b>v" FIRMWARE_VERSION "</b></p>"
       "<p><b>IP AP:</b> " + WiFi.softAPIP().toString() + "</p>"
       "<br>"
       "<a class='btn' href='/update'>📦 Atualizar Firmware</a><br>"
@@ -880,7 +887,8 @@ static int lerComDebounce(uint8_t pino, Debounce& d) {
 // ─── OTA remoto (pull por HTTPS, disparado por MQTT) ──────────────────────────
 // Comando:  TJS/<id>/OTA/SET   payload "VERSAO;URL;MD5"   (NÃO retained — retido é ignorado)
 //   VERSAO  versão que o binário contém (ignorado se já for a versão atual — evita laço de reflash)
-//   URL     precisa começar EXATAMENTE com OTA_URL_PREFIX (precisa de Content-Length)
+//   URL     precisa começar EXATAMENTE com OTA_URL_PREFIX (precisa de Content-Length) e o
+//           nome do arquivo precisa começar com "<modelo minúsculo>-" (ex.: fc300-1.4.3.bin)
 //   MD5     32 hex do .bin — o Update recusa a imagem se não bater
 // Estado:   TJS/<id>/OTA/STATE (retained): baixando / ok / erro: ... / ignorado: ... / rollback
 // SEGURANÇA: quem publica em OTA/SET troca o firmware. Restrinja por ACL no broker (só o BMS).
@@ -1015,6 +1023,20 @@ static void receberComandoOta(const String& payload) {
     return;
   }
   if (!url.startsWith(OTA_URL_PREFIX)) { mqttPublish(topic_ota_state, "erro: url nao permitida", true); return; }
+  // Trava de modelo: o nome do arquivo (último segmento da URL) precisa começar com "<modelo>-"
+  String arquivo = url;
+  int fim = arquivo.indexOf('?');
+  if (fim >= 0) arquivo = arquivo.substring(0, fim);
+  arquivo = arquivo.substring(arquivo.lastIndexOf('/') + 1);
+  String prefixoModelo = MODELO_CONTROLADORA "-";
+  prefixoModelo.toLowerCase();
+  String arquivoMin = arquivo;
+  arquivoMin.toLowerCase();
+  if (!arquivoMin.startsWith(prefixoModelo)) {
+    Serial.printf("   ⛔ OTA recusado: firmware de outro modelo (%s)\n", arquivo.c_str());
+    mqttPublish(topic_ota_state, "erro: firmware de outro modelo (" + arquivo + ")", true);
+    return;
+  }
   if (!md5Valido(md5))                 { mqttPublish(topic_ota_state, "erro: md5 invalido", true); return; }
 
   otaVersao = versao; otaUrl = url; otaMd5 = md5;
@@ -1232,6 +1254,7 @@ bool reconnectMQTT() {
     mqttPublish(topic_cmd_estado,  releAtivado ? "true" : "false", true);
     mqttPublish(topic_estado_real, estadoControladora == 1 ? "true" : "false", true);
     mqttPublish(topic_versao,      FIRMWARE_VERSION, true);
+    mqttPublish(topic_tipo,        TIPO_CONTROLADORA, true);
     mqttPublish(topic_modelo,      MODELO_CONTROLADORA, true);
     if (pressaoAplicada >= 0) mqttPublish(topic_pressao_estado, String(pressaoAplicada, 1), true);
     mqttPublish(topic_reset, motivoReset, true);
@@ -1649,6 +1672,7 @@ void setup() {
   topic_pressao        = prefix + "/PRESSAO/SET";
   topic_versao         = prefix + "/VERSAO";
   topic_modelo         = prefix + "/MODELO";
+  topic_tipo           = prefix + "/TIPO";
   topic_pressao_estado = prefix + "/PRESSAO";
   topic_reset          = prefix + "/RESET";
   topic_rssi           = prefix + "/RSSI";
@@ -1664,7 +1688,8 @@ void setup() {
   carregarCredMqtt();
 
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  Serial.println("🔧 CONTROLADORA HVAC " MODELO_CONTROLADORA " | ID: " + mqtt_id + " | v" FIRMWARE_VERSION);
+  Serial.println("🔧 CONTROLADORA HVAC " TIPO_CONTROLADORA " " MODELO_CONTROLADORA " | ID: " + mqtt_id + " | v" FIRMWARE_VERSION);
+  Serial.println(String("   ") + NXFW_TAG);
   Serial.printf( "   RELE1   GPIO%-2d  NIVEL=%s\n", RELE1_PIN, RELE_LIGADO == HIGH ? "HIGH" : "LOW");
   Serial.printf( "   DS18B20 GPIO%-2d\n", ONE_WIRE_BUS);
   Serial.printf( "   AO1 VAG GPIO%-2d (DAC1)\n", AO_VAG);

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Empacota o firmware.bin para distribuição via OTA remoto (TJS/<id>/OTA/SET).
 
-Copia o binário compilado para dist/hvac-<versao>.bin, calcula o SHA-256 e
-imprime a linha pronta para publicar no tópico OTA/SET.
+Lê TIPO_CONTROLADORA, MODELO_CONTROLADORA e FIRMWARE_VERSION do src/main.cpp,
+copia o binário compilado para dist/<modelo minúsculo>-<versao>.bin
+(ex.: fc300-1.4.3.bin), confere a assinatura NXFW dentro do .bin, calcula
+MD5 (o que o firmware valida) e SHA-256, e imprime a linha pronta para
+publicar no tópico OTA/SET. Padrão: docs/PADRAO_CONTROLADORAS.md
 
 Uso automático: já referenciado em platformio.ini (extra_scripts = post:...) —
 roda sozinho depois de `pio run`.
@@ -14,35 +17,54 @@ import re
 import shutil
 from pathlib import Path
 
-URL_PREFIX = "https://bmstjs.pilaresautomacao.com.br/firmware/"
+# O NX-360 hospeda o arquivo em <URL_PREFIX><token>/<arquivo>.bin
+URL_PREFIX = "https://bmstjs.pilaresautomacao.com.br/api/firmware/files/"
 
 
-def ler_versao(root: Path) -> str:
-    texto = (root / "src" / "main.cpp").read_text(encoding="utf-8")
-    m = re.search(r'#define\s+FIRMWARE_VERSION\s+"([^"]+)"', texto)
+def ler_define(texto: str, nome: str) -> str:
+    m = re.search(r'#define\s+' + nome + r'\s+"([^"]+)"', texto)
     if not m:
-        raise RuntimeError("FIRMWARE_VERSION não encontrado em src/main.cpp")
+        raise RuntimeError(f"{nome} não encontrado em src/main.cpp")
     return m.group(1)
 
 
-def empacotar(root: Path, bin_path: Path):
-    versao = ler_versao(root)
-    dist = root / "dist"
-    dist.mkdir(exist_ok=True)
-    destino = dist / f"hvac-{versao}.bin"
-    shutil.copy2(bin_path, destino)
+def ler_identificacao(root: Path):
+    texto = (root / "src" / "main.cpp").read_text(encoding="utf-8")
+    return (ler_define(texto, "TIPO_CONTROLADORA"),
+            ler_define(texto, "MODELO_CONTROLADORA"),
+            ler_define(texto, "FIRMWARE_VERSION"))
 
-    sha256 = hashlib.sha256(destino.read_bytes()).hexdigest()
-    url = URL_PREFIX + destino.name
+
+def empacotar(root: Path, bin_path: Path):
+    tipo, modelo, versao = ler_identificacao(root)
+    dados = bin_path.read_bytes()
 
     # Sem acentos/emoji: o console do Windows (cp1252) quebra ao imprimir alguns
     # caracteres durante o build do PlatformIO.
+    assinatura = f"NXFW|TIPO={tipo}|MODELO={modelo}|VERSAO={versao}|"
+    if assinatura.encode("ascii") not in dados:
+        raise RuntimeError(f"Assinatura '{assinatura}' NAO encontrada em {bin_path}")
+
+    dist = root / "dist"
+    dist.mkdir(exist_ok=True)
+    destino = dist / f"{modelo.lower()}-{versao}.bin"
+    shutil.copy2(bin_path, destino)
+
+    md5 = hashlib.md5(dados).hexdigest()
+    sha256 = hashlib.sha256(dados).hexdigest()
+    url = URL_PREFIX + "<token>/" + destino.name
+
     print("\nOTA empacotado:", destino)
-    print("   Tamanho :", destino.stat().st_size, "bytes")
-    print("   SHA-256 :", sha256)
-    print("\n   Comando para publicar em TJS/<id>/OTA/SET:")
-    print(f"   {versao};{url};{sha256}\n")
-    return destino, sha256, url
+    print("   Tipo      :", tipo)
+    print("   Modelo    :", modelo)
+    print("   Versao    :", versao)
+    print("   Assinatura:", assinatura, "(OK, presente no .bin)")
+    print("   Tamanho   :", len(dados), "bytes")
+    print("   MD5       :", md5, "(validado pelo firmware)")
+    print("   SHA-256   :", sha256)
+    print("\n   Comando para publicar em TJS/<id>/OTA/SET (<token> = gerado pelo NX-360):")
+    print(f"   {versao};{url};{md5}\n")
+    return destino, md5, sha256
 
 
 if __name__ == "__main__":
