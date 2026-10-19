@@ -23,22 +23,51 @@
 // proporcional na medição (P_ON_M): o Kp freia a variação da temperatura em vez de
 // reagir a degrau de setpoint; quem leva a temperatura até o setpoint é a integral.
 //
-// Sintonia em campo (mude UM parâmetro por vez e observe 1–2 h no Serial):
-//  - VAG ainda vai de um extremo ao outro, temperatura cruza o setpoint em ondas → aumente VAG_TI_S
-//    (720 → 1080 → 1440 s); se as ondas forem rápidas (< 10 min), reduza VAG_KP.
-//  - Temperatura fica parada fora da zona morta, VAG quase não se mexe → reduza VAG_TI_S (720 → 480 s).
-//  - Reação lenta a mudança de carga (porta aberta, sol) → aumente VAG_KP (30 → 40).
-//  - Válvula se mexendo à toa com temperatura estável → aumente VAG_ZONA_MORTA (0.2 → 0.3 °C)
+// Perfis de sintonia (v1.4.4): Kp, Ti, taxa e zona morta vêm de um PERFIL escolhido
+// remotamente em TJS/<id>/PID/SET e persistido no NVS (namespace "pid"). Sem dados salvos
+// → MUITO_LENTO, que é exatamente a sintonia fixa até a v1.4.3.
+//   Perfil         Kp(%/°C)  Ti(s)  Taxa(%/ciclo)  ZM(°C)
+//   MUITO_LENTO      30       720       5           0.20   ← padrão
+//   LENTO            35       480       7           0.20
+//   NORMAL           40       300      10           0.20
+//   RAPIDO           50       200      15           0.15
+//   MUITO_RAPIDO     60       120      20           0.15
+//   PERSONALIZADO  livres: Kp 5–100 | Ti 60–3600 | Taxa 1–20 | ZM 0.10–1.00
+// Troca de perfil é sem salto (SetTunings não zera a integral da PID_v1).
+//
+// Como escolher (troque UM degrau por vez e observe 1–2 h no PID/STATE):
+//  - VAG vai de um extremo ao outro, temperatura cruza o setpoint em ondas → perfil mais lento
+//    (ou, no PERSONALIZADO, Ti maior / Kp menor se as ondas forem rápidas, < 10 min).
+//  - Temperatura parada fora da zona morta, VAG quase não se mexe → perfil mais rápido (Ti menor).
+//  - Reação lenta a mudança de carga (porta aberta, sol) → perfil mais rápido (Kp maior).
+//  - Válvula se mexendo à toa com temperatura estável → zona morta maior (PERSONALIZADO, 0.3 °C)
 //    ou reduza VAG_ALFA_EMA (0.3 → 0.2, filtra mais porém atrasa).
 //  - Equilíbrio bom: temperatura dentro da zona morta, VAG parada num valor intermediário.
-const double        VAG_KP         = 30.0;                 // %/°C
-const double        VAG_TI_S       = 720.0;                // s — tempo integral
-const double        VAG_KI         = VAG_KP / VAG_TI_S;    // %/(°C·s) ≈ 0.042
+struct PerfilPid { const char* nome; double kp, ti, taxa, zm; };
+const PerfilPid PERFIS_PID[] = {
+  {"MUITO_LENTO",  30.0, 720.0,  5.0, 0.20},   // [0] = padrão
+  {"LENTO",        35.0, 480.0,  7.0, 0.20},
+  {"NORMAL",       40.0, 300.0, 10.0, 0.20},
+  {"RAPIDO",       50.0, 200.0, 15.0, 0.15},
+  {"MUITO_RAPIDO", 60.0, 120.0, 20.0, 0.15},
+};
+const size_t N_PERFIS_PID = sizeof(PERFIS_PID) / sizeof(PERFIS_PID[0]);
+// Faixas do PERSONALIZADO (também usadas para validar o que vem do NVS)
+const double PID_KP_MIN   = 5.0,  PID_KP_MAX   = 100.0;    // %/°C
+const double PID_TI_MIN   = 60.0, PID_TI_MAX   = 3600.0;   // s
+const double PID_TAXA_MIN = 1.0,  PID_TAXA_MAX = 20.0;     // %/ciclo
+const double PID_ZM_MIN   = 0.10, PID_ZM_MAX   = 1.00;     // °C
+
+// Sintonia em uso (carregada do NVS no setup; começa em MUITO_LENTO)
+String pidPerfil = "MUITO_LENTO";
+double pidKp     = 30.0;     // %/°C
+double pidTi     = 720.0;    // s — tempo integral (Ki = Kp / Ti)
+double pidTaxa   = 5.0;      // %  — variação máxima da saída por ciclo
+double pidZm     = 0.20;     // °C — |setpoint − temp filtrada| <= isto: mantém a saída
+
 const double        VAG_KD         = 0.0;                  // D desligado: só amplificaria ruído do sensor
 const unsigned long CICLO_PID_MS   = 30000UL;              // período de leitura + Compute() (= SetSampleTime)
 const double        VAG_ALFA_EMA   = 0.3;                  // filtro da temperatura, por leitura (0–1; menor = mais filtrado)
-const double        VAG_ZONA_MORTA = 0.2;                  // °C — |setpoint − temp filtrada| <= isto: mantém a saída
-const double        VAG_TAXA_MAX   = 5.0;                  // %  — variação máxima da saída por ciclo
 const double        VAG_PASSO_MIN  = 1.0;                  // %  — só atualiza o atuador se mudar >= isto
 const double        PUB_VAG_DELTA  = 2.0;                  // %  — publica VAG se variar >= isto…
 const unsigned long PUB_VAG_MS     = 60000UL;              //      …ou a cada este intervalo
@@ -103,6 +132,10 @@ String topic_rssi;            // TJS/<id>/RSSI    — dBm (retido, a cada 5 min)
 String topic_uptime;          // TJS/<id>/UPTIME  — minutos (retido, a cada 5 min)
 String topic_ota;             // TJS/<id>/OTA/SET
 String topic_ota_state;       // TJS/<id>/OTA/STATE
+String topic_pid_set;         // TJS/<id>/PID/SET        — perfil de sintonia (JSON, NÃO retido)
+String topic_pid_config;      // TJS/<id>/PID/CONFIG     — sintonia em uso (retido)
+String topic_pid_state;       // TJS/<id>/PID/STATE      — telemetria a cada ciclo do PID (retido)
+String topic_setpoint_state;  // TJS/<id>/SETPOINT/STATE — setpoint efetivo (retido)
 
 // ─── Hardware ─────────────────────────────────────────────────────────────────
 #define ONE_WIRE_BUS    13
@@ -129,7 +162,7 @@ String topic_ota_state;       // TJS/<id>/OTA/STATE
 #define ADDR_PRESSAO     12   // float (4 bytes) — setpoint de pressão (%) persistido
 
 // ─── Versão do firmware ───────────────────────────────────────────────────────
-#define FIRMWARE_VERSION "1.4.3"
+#define FIRMWARE_VERSION "1.4.4"
 
 // ─── Identificação da controladora (padrão comum: docs/PADRAO_CONTROLADORAS.md) ─
 #define TIPO_CONTROLADORA   "FANCOIL"
@@ -199,7 +232,7 @@ const unsigned long buttonPressThreshold = 5000;
 double temperatura = NAN;   // temperatura FILTRADA (EMA) — entrada do PID; NAN até a 1ª leitura válida
 double vagPid      = 0;     // saída do PID (%) — memória do controlador
 double setpoint    = 23.0;  // default seguro
-PID pid1(&temperatura, &vagPid, &setpoint, VAG_KP, VAG_KI, VAG_KD, P_ON_M, REVERSE);
+PID pid1(&temperatura, &vagPid, &setpoint, pidKp, pidKp / pidTi, VAG_KD, P_ON_M, REVERSE);
 
 double vagAtuador   = 0;     // % efetivamente aplicado na AO1
 bool   naZonaMorta  = false;
@@ -614,6 +647,186 @@ void publicarVAG(bool forcar) {
   tsPubVag     = millis();
 }
 
+// ─── Setpoint efetivo (retido) ────────────────────────────────────────────────
+void publicarSetpointEstado() {
+  mqttPublish(topic_setpoint_state, String(setpoint, 1), true);
+}
+
+// ─── Perfis de PID ────────────────────────────────────────────────────────────
+static const PerfilPid* buscarPerfil(const String& nome) {
+  for (size_t i = 0; i < N_PERFIS_PID; i++)
+    if (nome == PERFIS_PID[i].nome) return &PERFIS_PID[i];
+  return nullptr;
+}
+
+static bool pidNaFaixa(double kp, double ti, double taxa, double zm) {
+  return kp   >= PID_KP_MIN   && kp   <= PID_KP_MAX   &&
+         ti   >= PID_TI_MIN   && ti   <= PID_TI_MAX   &&
+         taxa >= PID_TAXA_MIN && taxa <= PID_TAXA_MAX &&
+         zm   >= PID_ZM_MIN - 1e-6 && zm <= PID_ZM_MAX + 1e-6;   // folga do arredondamento float
+}
+
+static void usarPerfil(const PerfilPid& p) {
+  pidPerfil = p.nome; pidKp = p.kp; pidTi = p.ti; pidTaxa = p.taxa; pidZm = p.zm;
+}
+
+// NVS "pid": perfil/kp/ti/taxa/zm. Ausente ou inválido → MUITO_LENTO (= sintonia até a v1.4.3).
+void carregarPid() {
+  prefs.begin("pid", true);
+  String perfil = prefs.getString("perfil", "");
+  double kp   = prefs.getFloat("kp",   NAN);
+  double ti   = prefs.getFloat("ti",   NAN);
+  double taxa = prefs.getFloat("taxa", NAN);
+  double zm   = prefs.getFloat("zm",   NAN);
+  prefs.end();
+
+  const PerfilPid* p = buscarPerfil(perfil);
+  if (p) {
+    usarPerfil(*p);   // perfil pronto: valores sempre da tabela
+  } else if (perfil == "PERSONALIZADO" && pidNaFaixa(kp, ti, taxa, zm)) {
+    pidPerfil = perfil; pidKp = kp; pidTi = ti; pidTaxa = taxa; pidZm = zm;
+  } else {
+    if (perfil.length()) Serial.printf("⚠️ PID salvo inválido (\"%s\") — usando MUITO_LENTO\n", perfil.c_str());
+    usarPerfil(PERFIS_PID[0]);
+  }
+  Serial.printf("🎛️ PID | perfil=%s | Kp=%.2f Ti=%.0fs Taxa=%.1f%% ZM=%.2f°C\n",
+                pidPerfil.c_str(), pidKp, pidTi, pidTaxa, pidZm);
+}
+
+// Grava no NVS (o chamador só chama quando algo mudou — protege a flash)
+static void salvarPid() {
+  prefs.begin("pid", false);
+  prefs.putString("perfil", pidPerfil);
+  prefs.putFloat("kp",   (float)pidKp);
+  prefs.putFloat("ti",   (float)pidTi);
+  prefs.putFloat("taxa", (float)pidTaxa);
+  prefs.putFloat("zm",   (float)pidZm);
+  prefs.end();
+}
+
+// Número curto para JSON: até 2 casas, sem zeros à direita (40 / 0.2 / 45.5)
+static String numJson(double v) {
+  String s = String(v, 2);
+  if (s.indexOf('.') >= 0) {
+    while (s.endsWith("0")) s.remove(s.length() - 1);
+    if (s.endsWith(".")) s.remove(s.length() - 1);
+  }
+  return s;
+}
+
+// PID/CONFIG (retido): {"perfil":"NORMAL","kp":40,"ti":300,"taxa":10,"zm":0.2,"ciclo":30[,"erro":"..."]}
+void publicarPidConfig(const String& erro = "") {
+  String js = "{\"perfil\":\"" + pidPerfil + "\",\"kp\":" + numJson(pidKp) + ",\"ti\":" + numJson(pidTi) +
+              ",\"taxa\":" + numJson(pidTaxa) + ",\"zm\":" + numJson(pidZm) +
+              ",\"ciclo\":" + String(CICLO_PID_MS / 1000);
+  if (erro.length()) js += ",\"erro\":\"" + erro + "\"";
+  js += "}";
+  mqttPublish(topic_pid_config, js, true);
+}
+
+// PID/STATE (retido), uma vez por ciclo. temp/erro = null com sensor em falha;
+// relé desligado → pid/vag 0 e zm false.
+void publicarPidState(float bruta) {
+  bool   temOk = !sensorEmFalha && !isnan(temperatura);
+  String js = "{\"sp\":" + String(setpoint, 1) +
+              ",\"temp\":" + (temOk ? String(temperatura, 1) : String("null")) +
+              ",\"bruta\":" + String(bruta, 1) +
+              ",\"erro\":" + (temOk ? String(setpoint - temperatura, 1) : String("null")) +
+              ",\"pid\":" + String(releAtivado ? vagPid : 0.0, 1) +
+              ",\"vag\":" + String(releAtivado ? vagAtuador : 0.0, 1) +
+              ",\"zm\":" + ((releAtivado && naZonaMorta) ? "true" : "false") +
+              ",\"rele\":" + (releAtivado ? "true" : "false") + "}";
+  mqttPublish(topic_pid_state, js, true);
+}
+
+// Parser JSON mínimo para o PID/SET: objeto plano, valores string ou número.
+// (ArduinoJson custaria vários KB de flash com a partição já em ~84%; aqui só 5 chaves fixas.)
+// Devolve false se a chave não existe; o valor vem sem aspas e sem espaços.
+static bool jsonCampo(const String& js, const char* chave, String& valor) {
+  String alvo = String("\"") + chave + "\"";
+  int i = js.indexOf(alvo);
+  if (i < 0) return false;
+  i += alvo.length();
+  while (i < (int)js.length() && isspace((unsigned char)js[i])) i++;
+  if (i >= (int)js.length() || js[i] != ':') return false;
+  i++;
+  while (i < (int)js.length() && isspace((unsigned char)js[i])) i++;
+  if (i >= (int)js.length()) return false;
+  if (js[i] == '"') {
+    int f = js.indexOf('"', i + 1);
+    if (f < 0) return false;
+    valor = js.substring(i + 1, f);
+  } else {
+    int f = i;
+    while (f < (int)js.length() && js[f] != ',' && js[f] != '}') f++;
+    valor = js.substring(i, f);
+    valor.trim();
+  }
+  return true;
+}
+
+// Número estrito: o texto inteiro precisa ser numérico ("12", "0.2", "-3e1")
+static bool jsonNumero(const String& js, const char* chave, double& v, String& erro) {
+  String s;
+  if (!jsonCampo(js, chave, s)) { erro = String("campo ausente: ") + chave; return false; }
+  char* fim = nullptr;
+  v = strtod(s.c_str(), &fim);
+  if (s.length() == 0 || fim == nullptr || *fim != '\0' || isnan(v)) { erro = String(chave) + " invalido"; return false; }
+  return true;
+}
+
+// TJS/<id>/PID/SET: {"perfil":"NORMAL"} ou {"perfil":"PERSONALIZADO","kp":45,"ti":250,"taxa":12,"zm":0.2}
+// Aplica sem salto: SetTunings não zera o outputSum da PID_v1 — vagPid/vagAtuador seguem de onde estavam.
+static void receberComandoPid(const String& payload) {
+  String js = payload;
+  js.trim();
+  String erro, perfil;
+  double kp = 0, ti = 0, taxa = 0, zm = 0;
+
+  if (!js.startsWith("{") || !js.endsWith("}")) erro = "json invalido";
+  else if (!jsonCampo(js, "perfil", perfil) || perfil.length() == 0) erro = "perfil ausente";
+  else {
+    perfil.toUpperCase();
+    const PerfilPid* p = buscarPerfil(perfil);
+    if (p) {
+      kp = p->kp; ti = p->ti; taxa = p->taxa; zm = p->zm;   // perfil pronto: ignora kp/ti/taxa/zm do payload
+    } else if (perfil == "PERSONALIZADO") {
+      if      (!jsonNumero(js, "kp",   kp,   erro)) {}
+      else if (!jsonNumero(js, "ti",   ti,   erro)) {}
+      else if (!jsonNumero(js, "taxa", taxa, erro)) {}
+      else if (!jsonNumero(js, "zm",   zm,   erro)) {}
+      else if (kp   < PID_KP_MIN   || kp   > PID_KP_MAX)   erro = "kp fora da faixa (5-100)";
+      else if (ti   < PID_TI_MIN   || ti   > PID_TI_MAX)   erro = "ti fora da faixa (60-3600)";
+      else if (taxa < PID_TAXA_MIN || taxa > PID_TAXA_MAX) erro = "taxa fora da faixa (1-20)";
+      else if (zm   < PID_ZM_MIN   || zm   > PID_ZM_MAX)   erro = "zm fora da faixa (0.10-1.00)";
+    } else {
+      erro = "perfil desconhecido";
+    }
+  }
+
+  if (erro.length()) {
+    Serial.printf("   ⚠️ PID/SET recusado: %s — mantém %s\n", erro.c_str(), pidPerfil.c_str());
+    publicarPidConfig(erro);
+    return;
+  }
+
+  bool igual = perfil == pidPerfil && fabs(kp - pidKp) < 1e-3 && fabs(ti - pidTi) < 1e-3 &&
+               fabs(taxa - pidTaxa) < 1e-3 && fabs(zm - pidZm) < 1e-3;
+  if (igual) {
+    Serial.printf("   ℹ️ PID já em %s com os mesmos valores — nada a gravar\n", pidPerfil.c_str());
+    publicarPidConfig();
+    return;
+  }
+
+  Serial.printf("   🎛️ PID %s (Kp=%.2f Ti=%.0fs Taxa=%.1f%% ZM=%.2f°C) → %s (Kp=%.2f Ti=%.0fs Taxa=%.1f%% ZM=%.2f°C)\n",
+                pidPerfil.c_str(), pidKp, pidTi, pidTaxa, pidZm,
+                perfil.c_str(), kp, ti, taxa, zm);
+  pidPerfil = perfil; pidKp = kp; pidTi = ti; pidTaxa = taxa; pidZm = zm;
+  pid1.SetTunings(pidKp, pidKp / pidTi, VAG_KD, P_ON_M);   // sem SetMode: integral preservada
+  salvarPid();
+  publicarPidConfig();
+}
+
 // ─── Liga relé ────────────────────────────────────────────────────────────────
 void ligarRele(const char* motivo) {
   Serial.printf("🔌 ligarRele() | motivo: %s | releAtivado: %s\n",
@@ -811,7 +1024,7 @@ static void executarSlot(const SlotAgenda& s) {
       else             desligarRele("agenda");
       break;
     case ACAO_SETPOINT:
-      if (fabs(s.valor - setpoint) > 0.01) { setpoint = s.valor; salvarSetpoint(); }
+      if (fabs(s.valor - setpoint) > 0.01) { setpoint = s.valor; salvarSetpoint(); publicarSetpointEstado(); }
       mqttPublish(topic_setpoint, String(setpoint, 1), true);
       break;
   }
@@ -1246,6 +1459,7 @@ bool reconnectMQTT() {
     client.subscribe(topic_schedule, 1); Serial.println("📋 Subscrito: " + topic_schedule);
     client.subscribe(topic_pressao,  1); Serial.println("📋 Subscrito: " + topic_pressao);
     client.subscribe(topic_ota,      1); Serial.println("📋 Subscrito: " + topic_ota);
+    client.subscribe(topic_pid_set,  1); Serial.println("📋 Subscrito: " + topic_pid_set);
     modoAnterior   = -1;
     statusAnterior = -1;
     lerEPublicarEntradas();
@@ -1262,7 +1476,9 @@ bool reconnectMQTT() {
     client.publish(topic_online.c_str(), "1", true, 1); // confirma presença (retido, QoS 1)
     publicarEstadoAgenda();
     publicarRollbackPendente();
-    vagPublicada = -1;   // VAG republicada no próximo ciclo do PID
+    publicarPidConfig();
+    publicarSetpointEstado();
+    vagPublicada = -1;  // VAG republicada no próximo ciclo do PID
     return true;
   }
   Serial.printf("⚠️ MQTT falhou | erro: %d | retorno do broker: %d\n",
@@ -1381,7 +1597,7 @@ void messageReceived(String &topic, String &payload) {
   if (topic == topic_setpoint) {
     float sp = payload.toFloat();
     if (sp >= 10.0 && sp <= 35.0) {
-      if (fabs(sp - setpoint) > 0.01) { setpoint = sp; salvarSetpoint(); }
+      if (fabs(sp - setpoint) > 0.01) { setpoint = sp; salvarSetpoint(); publicarSetpointEstado(); }
       Serial.printf("   🌡️  Setpoint → %.1f°C\n", setpoint);
     } else {
       Serial.printf("   ⚠️ Setpoint fora da faixa (10–35°C): \"%s\" — ignorado\n", payload.c_str());
@@ -1414,6 +1630,9 @@ void messageReceived(String &topic, String &payload) {
   }
   else if (topic == topic_ota) {
     receberComandoOta(payload);
+  }
+  else if (topic == topic_pid_set) {
+    receberComandoPid(payload);
   }
   else if (topic == topic_schedule) {
     if (payload == agendaPayload) {
@@ -1479,9 +1698,9 @@ void mqttMensagemRecebida(MQTTClient* c, char topico[], char bytes[], int tamanh
   String payload;
   if (bytes != nullptr) payload = String((const char*)bytes);   // mesmo tratamento do onMessage simples
 
-  if (mqttMsgRetida && topic == topic_ota) {
+  if (mqttMsgRetida && (topic == topic_ota || topic == topic_pid_set)) {
     Serial.printf("📩 RECEBIDO  [%s] → \"%s\" 📌\n", topic.c_str(), payload.c_str());
-    Serial.println("   ⚠️ OTA retido ignorado");
+    Serial.println(topic == topic_ota ? "   ⚠️ OTA retido ignorado" : "   ⚠️ PID/SET retido ignorado");
     return;
   }
   messageReceived(topic, payload);
@@ -1504,6 +1723,7 @@ void vagPID() {
       tsPubVag     = millis();
     }
     mqttPublish(topic_temperatura, "ERRO", true);
+    publicarPidState(leitura);
     return;
   }
   if (sensorEmFalha) {
@@ -1519,6 +1739,7 @@ void vagPID() {
   if (!releAtivado) {
     Serial.printf("   🌡️  Temp: %.2f°C (bruta %.2f) | Relé desligado\n", temperatura, leitura);
     publicarVAG(false);
+    publicarPidState(leitura);
     return;
   }
 
@@ -1526,7 +1747,7 @@ void vagPID() {
   if (pid1.GetMode() == MANUAL) pid1.SetMode(AUTOMATIC);
 
   double erro = setpoint - temperatura;
-  if (fabs(erro) <= VAG_ZONA_MORTA) {
+  if (fabs(erro) <= pidZm) {
     naZonaMorta = true;           // Compute() não roda: saída mantida e sem integrar
   } else {
     if (naZonaMorta) {            // saída da zona morta sem salto: PID retoma do valor aplicado
@@ -1538,14 +1759,16 @@ void vagPID() {
     pid1.Compute();
 
     // Limite de taxa + passo mínimo no atuador
-    double alvo    = vagAtuador + constrain(vagPid - vagAtuador, -VAG_TAXA_MAX, VAG_TAXA_MAX);
+    double alvo    = vagAtuador + constrain(vagPid - vagAtuador, -pidTaxa, pidTaxa);
     bool   extremo = (alvo <= 0.0 || alvo >= 100.0) && alvo != vagAtuador;   // fechar/abrir totalmente
     if (fabs(alvo - vagAtuador) >= VAG_PASSO_MIN || extremo) escreverVAG(alvo);
   }
 
-  Serial.printf("   🌡️  Temp: %.2f°C (bruta %.2f) | SP: %.1f°C | PID: %.1f%% | VAG: %.1f%%%s\n",
-                temperatura, leitura, setpoint, vagPid, vagAtuador, naZonaMorta ? " [zona morta]" : "");
+  Serial.printf("   🌡️  Temp: %.2f°C (bruta %.2f) | SP: %.1f°C | PID: %.1f%% | VAG: %.1f%%%s | Perfil: %s\n",
+                temperatura, leitura, setpoint, vagPid, vagAtuador, naZonaMorta ? " [zona morta]" : "",
+                pidPerfil.c_str());
   publicarVAG(false);
+  publicarPidState(leitura);
 }
 
 // ─── Restauro das saídas no boot ──────────────────────────────────────────────
@@ -1643,7 +1866,9 @@ void setup() {
   sensors.setResolution(12);
 
   client.onMessageAdvanced(mqttMensagemRecebida);
-  pid1.SetOutputLimits(0, 100);          // saída em %; conversão para o DAC só em saidaAnalogica()
+  carregarPid();                         // perfil do NVS (ou MUITO_LENTO) antes de configurar o PID
+  pid1.SetTunings(pidKp, pidKp / pidTi, VAG_KD, P_ON_M);
+  pid1.SetOutputLimits(0, 100);         // saída em %; conversão para o DAC só em saidaAnalogica()
   pid1.SetSampleTime(CICLO_PID_MS);      // = intervalo real entre Compute()
   pid1.SetMode(MANUAL);                  // vai para AUTOMATIC (a partir de vagPid) na 1ª leitura válida
 
@@ -1679,6 +1904,10 @@ void setup() {
   topic_uptime         = prefix + "/UPTIME";
   topic_ota            = prefix + "/OTA/SET";
   topic_ota_state      = prefix + "/OTA/STATE";
+  topic_pid_set        = prefix + "/PID/SET";
+  topic_pid_config     = prefix + "/PID/CONFIG";
+  topic_pid_state      = prefix + "/PID/STATE";
+  topic_setpoint_state = prefix + "/SETPOINT/STATE";
 
   // Client ID fixo e único: MAC completo (o ID curto de 4 dígitos pode colidir entre placas,
   // e o broker derruba a conexão antiga a cada nova com o mesmo ID → laço de reconexões)

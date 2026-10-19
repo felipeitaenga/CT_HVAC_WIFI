@@ -54,7 +54,7 @@ Prefixo: `TJS/<id>/`, onde `<id>` é o ID curto da placa (derivado do MAC).
 O LWT é configurado como `TJS/<id>/ONLINE` = `0`, retido, QoS 1.
 
 Tópicos específicos de cada tipo (ex.: `SETPOINT`, `VAG`, `PRESSAO` no fancoil) ficam fora deste
-contrato e são documentados no próprio firmware.
+contrato e são documentados no próprio firmware. Os do FANCOIL estão na seção 6.
 
 ---
 
@@ -126,3 +126,69 @@ Roda automaticamente após cada `pio run` (`extra_scripts = post:scripts/publica
 - [ ] `OTA/SET` com `VERSAO;URL;MD5`, prefixo de URL, trava de modelo, MD5 e rollback
 - [ ] Estados de `OTA/STATE` com os mesmos textos da tabela acima
 - [ ] `scripts/publicar_ota.py` copiado e gerando `<modelo>-<versao>.bin`
+- [ ] Comandos JSON (`.../SET`) seguem o padrão da seção 6: mensagem retida ignorada, erro
+      devolvido no tópico de configuração com `"erro":"<motivo curto>"`, NVS gravada só se mudar
+
+---
+
+## 6. Tópicos específicos do tipo FANCOIL (FC300, a partir da v1.4.4)
+
+Não fazem parte do contrato comum, mas servem de modelo para comandos JSON de outros tipos
+(ex.: perfis de dimerização na iluminação).
+
+| Tópico | Direção | Retido | Conteúdo |
+|---|---|---|---|
+| `PID/SET` | BMS → placa | **não** (retido é ignorado) | perfil de sintonia em JSON (abaixo) |
+| `PID/CONFIG` | placa → BMS | sim | sintonia em uso — na conexão, após cada `PID/SET` |
+| `PID/STATE` | placa → BMS | sim | telemetria do controle a cada ciclo do PID (30 s) |
+| `SETPOINT/STATE` | placa → BMS | sim | setpoint efetivo, 1 casa (`23.0`) — na conexão e sempre que muda (`SETPOINT/SET`, agenda) |
+
+### `PID/SET`
+
+```json
+{"perfil":"NORMAL"}
+{"perfil":"PERSONALIZADO","kp":45,"ti":250,"taxa":12,"zm":0.2}
+```
+
+| Perfil | Kp (%/°C) | Ti (s) | Taxa (%/ciclo) | Zona morta (°C) |
+|---|---|---|---|---|
+| `MUITO_LENTO` (padrão) | 30 | 720 | 5 | 0.20 |
+| `LENTO` | 35 | 480 | 7 | 0.20 |
+| `NORMAL` | 40 | 300 | 10 | 0.20 |
+| `RAPIDO` | 50 | 200 | 15 | 0.15 |
+| `MUITO_RAPIDO` | 60 | 120 | 20 | 0.15 |
+| `PERSONALIZADO` | 5–100 | 60–3600 | 1–20 | 0.10–1.00 |
+
+- Perfil pronto: `kp/ti/taxa/zm` do payload são ignorados (vale a tabela).
+- Perfil desconhecido, campo faltando, JSON inválido ou valor fora da faixa: nada é aplicado e
+  `PID/CONFIG` é republicado com a configuração atual mais `"erro"`. Motivos:
+  `json invalido`, `perfil ausente`, `perfil desconhecido`, `campo ausente: <campo>`,
+  `<campo> invalido`, `<campo> fora da faixa (<min>-<max>)`.
+- Troca sem salto: a saída da VAG continua de onde estava.
+- Persistido no NVS (namespace `pid`); sem dado salvo ou inválido → `MUITO_LENTO`.
+
+### `PID/CONFIG`
+
+```json
+{"perfil":"NORMAL","kp":40,"ti":300,"taxa":10,"zm":0.2,"ciclo":30}
+{"perfil":"NORMAL","kp":40,"ti":300,"taxa":10,"zm":0.2,"ciclo":30,"erro":"perfil desconhecido"}
+```
+
+`ciclo` = período do PID em segundos (fixo).
+
+### `PID/STATE`
+
+```json
+{"sp":18.0,"temp":23.4,"bruta":23.5,"erro":-5.4,"pid":42.0,"vag":35.0,"zm":false,"rele":true}
+```
+
+| Campo | Significado |
+|---|---|
+| `sp` | setpoint (°C) |
+| `temp` | temperatura filtrada (°C); `null` com o sensor em falha |
+| `bruta` | leitura bruta do DS18B20 (°C); em falha mostra o código do sensor (`-127.0` / `85.0`) |
+| `erro` | `sp − temp` (°C); `null` com o sensor em falha |
+| `pid` | saída calculada pelo PID (%); `0` com o relé desligado |
+| `vag` | saída aplicada na AO1 (%); `0` com o relé desligado |
+| `zm` | `true` se está dentro da zona morta (saída mantida) |
+| `rele` | fancoil ligado |
