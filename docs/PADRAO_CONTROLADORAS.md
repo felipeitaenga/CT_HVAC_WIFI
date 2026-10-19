@@ -152,9 +152,9 @@ Não fazem parte do contrato comum, mas servem de modelo para comandos JSON de o
 
 | Perfil | Kp (%/°C) | Ti (s) | Taxa (%/ciclo) | Zona morta (°C) |
 |---|---|---|---|---|
-| `MUITO_LENTO` (padrão) | 30 | 720 | 5 | 0.20 |
+| `MUITO_LENTO` | 30 | 720 | 5 | 0.20 |
 | `LENTO` | 35 | 480 | 7 | 0.20 |
-| `NORMAL` | 40 | 300 | 10 | 0.20 |
+| `NORMAL` (padrão de fábrica) | 40 | 300 | 10 | 0.20 |
 | `RAPIDO` | 50 | 200 | 15 | 0.15 |
 | `MUITO_RAPIDO` | 60 | 120 | 20 | 0.15 |
 | `PERSONALIZADO` | 5–100 | 60–3600 | 1–20 | 0.10–1.00 |
@@ -165,7 +165,12 @@ Não fazem parte do contrato comum, mas servem de modelo para comandos JSON de o
   `json invalido`, `perfil ausente`, `perfil desconhecido`, `campo ausente: <campo>`,
   `<campo> invalido`, `<campo> fora da faixa (<min>-<max>)`.
 - Troca sem salto: a saída da VAG continua de onde estava.
-- Persistido no NVS (namespace `pid`); sem dado salvo ou inválido → `MUITO_LENTO`.
+- Persistido no NVS (namespace `pid`) **só ao receber `PID/SET`**; sem dado salvo ou inválido →
+  padrão de fábrica: `NORMAL` (desde a v1.4.5; antes `MUITO_LENTO`). O padrão nunca é gravado
+  no boot, então quem nunca recebeu comando segue o padrão do firmware em execução.
+- Um `PID/SET` igual à sintonia atual não regrava o NVS — exceto se a placa ainda estiver no
+  padrão sem nada salvo: aí grava uma vez, para a escolha explícita sobreviver a futuras
+  mudanças de padrão.
 
 ### `PID/CONFIG`
 

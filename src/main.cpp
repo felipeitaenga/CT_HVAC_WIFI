@@ -24,12 +24,14 @@
 // reagir a degrau de setpoint; quem leva a temperatura até o setpoint é a integral.
 //
 // Perfis de sintonia (v1.4.4): Kp, Ti, taxa e zona morta vêm de um PERFIL escolhido
-// remotamente em TJS/<id>/PID/SET e persistido no NVS (namespace "pid"). Sem dados salvos
-// → MUITO_LENTO, que é exatamente a sintonia fixa até a v1.4.3.
+// remotamente em TJS/<id>/PID/SET e persistido no NVS (namespace "pid").
+// Padrão de fábrica: NORMAL (desde a v1.4.5; até a v1.4.4 era MUITO_LENTO). O padrão NÃO é
+// gravado no NVS: sem PID/SET recebido a placa segue o padrão do firmware que estiver rodando;
+// depois do primeiro PID/SET ela mantém o perfil salvo.
 //   Perfil         Kp(%/°C)  Ti(s)  Taxa(%/ciclo)  ZM(°C)
-//   MUITO_LENTO      30       720       5           0.20   ← padrão
+//   MUITO_LENTO      30       720       5           0.20
 //   LENTO            35       480       7           0.20
-//   NORMAL           40       300      10           0.20
+//   NORMAL           40       300      10           0.20   ← padrão de fábrica
 //   RAPIDO           50       200      15           0.15
 //   MUITO_RAPIDO     60       120      20           0.15
 //   PERSONALIZADO  livres: Kp 5–100 | Ti 60–3600 | Taxa 1–20 | ZM 0.10–1.00
@@ -45,25 +47,27 @@
 //  - Equilíbrio bom: temperatura dentro da zona morta, VAG parada num valor intermediário.
 struct PerfilPid { const char* nome; double kp, ti, taxa, zm; };
 const PerfilPid PERFIS_PID[] = {
-  {"MUITO_LENTO",  30.0, 720.0,  5.0, 0.20},   // [0] = padrão
+  {"MUITO_LENTO",  30.0, 720.0,  5.0, 0.20},
   {"LENTO",        35.0, 480.0,  7.0, 0.20},
-  {"NORMAL",       40.0, 300.0, 10.0, 0.20},
+  {"NORMAL",       40.0, 300.0, 10.0, 0.20},   // padrão de fábrica
   {"RAPIDO",       50.0, 200.0, 15.0, 0.15},
   {"MUITO_RAPIDO", 60.0, 120.0, 20.0, 0.15},
 };
 const size_t N_PERFIS_PID = sizeof(PERFIS_PID) / sizeof(PERFIS_PID[0]);
+const PerfilPid& PERFIL_PID_PADRAO = PERFIS_PID[2];   // NORMAL
 // Faixas do PERSONALIZADO (também usadas para validar o que vem do NVS)
 const double PID_KP_MIN   = 5.0,  PID_KP_MAX   = 100.0;    // %/°C
 const double PID_TI_MIN   = 60.0, PID_TI_MAX   = 3600.0;   // s
 const double PID_TAXA_MIN = 1.0,  PID_TAXA_MAX = 20.0;     // %/ciclo
 const double PID_ZM_MIN   = 0.10, PID_ZM_MAX   = 1.00;     // °C
 
-// Sintonia em uso (carregada do NVS no setup; começa em MUITO_LENTO)
-String pidPerfil = "MUITO_LENTO";
-double pidKp     = 30.0;     // %/°C
-double pidTi     = 720.0;    // s — tempo integral (Ki = Kp / Ti)
-double pidTaxa   = 5.0;      // %  — variação máxima da saída por ciclo
+// Sintonia em uso (carregada do NVS no setup; começa no padrão de fábrica NORMAL)
+String pidPerfil = "NORMAL";
+double pidKp     = 40.0;     // %/°C
+double pidTi     = 300.0;    // s — tempo integral (Ki = Kp / Ti)
+double pidTaxa   = 10.0;     // %  — variação máxima da saída por ciclo
 double pidZm     = 0.20;     // °C — |setpoint − temp filtrada| <= isto: mantém a saída
+bool   pidSalvo  = false;    // true se o NVS tem um perfil válido gravado por PID/SET
 
 const double        VAG_KD         = 0.0;                  // D desligado: só amplificaria ruído do sensor
 const unsigned long CICLO_PID_MS   = 30000UL;              // período de leitura + Compute() (= SetSampleTime)
@@ -162,7 +166,7 @@ String topic_setpoint_state;  // TJS/<id>/SETPOINT/STATE — setpoint efetivo (r
 #define ADDR_PRESSAO     12   // float (4 bytes) — setpoint de pressão (%) persistido
 
 // ─── Versão do firmware ───────────────────────────────────────────────────────
-#define FIRMWARE_VERSION "1.4.4"
+#define FIRMWARE_VERSION "1.4.5"
 
 // ─── Identificação da controladora (padrão comum: docs/PADRAO_CONTROLADORAS.md) ─
 #define TIPO_CONTROLADORA   "FANCOIL"
@@ -670,7 +674,8 @@ static void usarPerfil(const PerfilPid& p) {
   pidPerfil = p.nome; pidKp = p.kp; pidTi = p.ti; pidTaxa = p.taxa; pidZm = p.zm;
 }
 
-// NVS "pid": perfil/kp/ti/taxa/zm. Ausente ou inválido → MUITO_LENTO (= sintonia até a v1.4.3).
+// NVS "pid": perfil/kp/ti/taxa/zm. Ausente ou inválido → padrão de fábrica (NORMAL),
+// sem gravar no NVS: só PID/SET grava.
 void carregarPid() {
   prefs.begin("pid", true);
   String perfil = prefs.getString("perfil", "");
@@ -683,14 +688,18 @@ void carregarPid() {
   const PerfilPid* p = buscarPerfil(perfil);
   if (p) {
     usarPerfil(*p);   // perfil pronto: valores sempre da tabela
+    pidSalvo = true;
   } else if (perfil == "PERSONALIZADO" && pidNaFaixa(kp, ti, taxa, zm)) {
     pidPerfil = perfil; pidKp = kp; pidTi = ti; pidTaxa = taxa; pidZm = zm;
+    pidSalvo = true;
   } else {
-    if (perfil.length()) Serial.printf("⚠️ PID salvo inválido (\"%s\") — usando MUITO_LENTO\n", perfil.c_str());
-    usarPerfil(PERFIS_PID[0]);
+    if (perfil.length()) Serial.printf("⚠️ PID salvo inválido (\"%s\") — usando o padrão %s\n",
+                                       perfil.c_str(), PERFIL_PID_PADRAO.nome);
+    usarPerfil(PERFIL_PID_PADRAO);
+    pidSalvo = false;
   }
-  Serial.printf("🎛️ PID | perfil=%s | Kp=%.2f Ti=%.0fs Taxa=%.1f%% ZM=%.2f°C\n",
-                pidPerfil.c_str(), pidKp, pidTi, pidTaxa, pidZm);
+  Serial.printf("🎛️ PID | perfil=%s%s | Kp=%.2f Ti=%.0fs Taxa=%.1f%% ZM=%.2f°C\n",
+                pidPerfil.c_str(), pidSalvo ? "" : " (padrão de fábrica)", pidKp, pidTi, pidTaxa, pidZm);
 }
 
 // Grava no NVS (o chamador só chama quando algo mudou — protege a flash)
@@ -702,6 +711,7 @@ static void salvarPid() {
   prefs.putFloat("taxa", (float)pidTaxa);
   prefs.putFloat("zm",   (float)pidZm);
   prefs.end();
+  pidSalvo = true;
 }
 
 // Número curto para JSON: até 2 casas, sem zeros à direita (40 / 0.2 / 45.5)
@@ -813,7 +823,12 @@ static void receberComandoPid(const String& payload) {
   bool igual = perfil == pidPerfil && fabs(kp - pidKp) < 1e-3 && fabs(ti - pidTi) < 1e-3 &&
                fabs(taxa - pidTaxa) < 1e-3 && fabs(zm - pidZm) < 1e-3;
   if (igual) {
-    Serial.printf("   ℹ️ PID já em %s com os mesmos valores — nada a gravar\n", pidPerfil.c_str());
+    if (!pidSalvo) {   // escolha explícita do padrão de fábrica: grava uma vez para fixá-la
+      Serial.printf("   💾 PID %s confirmado por comando — gravado no NVS\n", pidPerfil.c_str());
+      salvarPid();
+    } else {
+      Serial.printf("   ℹ️ PID já em %s com os mesmos valores — nada a gravar\n", pidPerfil.c_str());
+    }
     publicarPidConfig();
     return;
   }
@@ -1866,7 +1881,7 @@ void setup() {
   sensors.setResolution(12);
 
   client.onMessageAdvanced(mqttMensagemRecebida);
-  carregarPid();                         // perfil do NVS (ou MUITO_LENTO) antes de configurar o PID
+  carregarPid();                         // perfil do NVS (ou padrão NORMAL) antes de configurar o PID
   pid1.SetTunings(pidKp, pidKp / pidTi, VAG_KD, P_ON_M);
   pid1.SetOutputLimits(0, 100);         // saída em %; conversão para o DAC só em saidaAnalogica()
   pid1.SetSampleTime(CICLO_PID_MS);      // = intervalo real entre Compute()

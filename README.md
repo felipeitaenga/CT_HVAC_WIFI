@@ -35,14 +35,17 @@ Prefixo `TJS/<id>/` (`<id>` = 4 últimos caracteres hex do MAC). Tópicos de est
 
 ## Perfis de PID
 
-Escolhidos em `TJS/<id>/PID/SET` e gravados no NVS. Sem dado salvo → `MUITO_LENTO`
-(a sintonia fixa usada até a v1.4.3). A troca é sem salto na VAG.
+Escolhidos em `TJS/<id>/PID/SET` e gravados no NVS. A troca é sem salto na VAG.
+
+**Padrão de fábrica: NORMAL** (desde a v1.4.5; até a v1.4.4 era `MUITO_LENTO`). O padrão não é
+gravado no NVS: a placa que nunca recebeu `PID/SET` sempre segue o padrão do firmware que está
+rodando; a que já recebeu mantém o perfil salvo, mesmo após atualizar o firmware.
 
 | Perfil | Kp (%/°C) | Ti (s) | Taxa (%/ciclo) | Zona morta (°C) |
 |---|---|---|---|---|
-| `MUITO_LENTO` (padrão) | 30 | 720 | 5 | 0.20 |
+| `MUITO_LENTO` | 30 | 720 | 5 | 0.20 |
 | `LENTO` | 35 | 480 | 7 | 0.20 |
-| `NORMAL` | 40 | 300 | 10 | 0.20 |
+| `NORMAL` (padrão de fábrica) | 40 | 300 | 10 | 0.20 |
 | `RAPIDO` | 50 | 200 | 15 | 0.15 |
 | `MUITO_RAPIDO` | 60 | 120 | 20 | 0.15 |
 | `PERSONALIZADO` | 5–100 | 60–3600 | 1–20 | 0.10–1.00 |
